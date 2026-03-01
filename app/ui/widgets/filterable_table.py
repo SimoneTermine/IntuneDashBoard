@@ -3,15 +3,16 @@ Filterable, sortable table widget.
 Wraps QTableWidget with column config and quick-filter.
 """
 
+import json
 from datetime import datetime
 from typing import Any
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QLabel, QLineEdit, QPushButton, QComboBox, QAbstractItemView,
+    QLabel, QLineEdit, QPushButton, QAbstractItemView, QMenu,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QAction
 
 
 COMPLIANCE_COLORS = {
@@ -39,6 +40,7 @@ class FilterableTable(QWidget):
 
     row_selected = Signal(int, dict)  # row index, row data dict
     export_requested = Signal()
+    row_action_requested = Signal(str, dict)  # action name, row data
 
     def __init__(self, columns: list[tuple], parent=None):
         super().__init__(parent)
@@ -90,6 +92,8 @@ class FilterableTable(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setShowGrid(False)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._show_context_menu)
 
         for i, (_, _, width) in enumerate(self._columns):
             self._table.setColumnWidth(i, width)
@@ -142,6 +146,44 @@ class FilterableTable(QWidget):
             row_data = item.data(Qt.UserRole)
             if row_data:
                 self.row_selected.emit(self._table.currentRow(), row_data)
+
+    def _show_context_menu(self, pos):
+        item = self._table.itemAt(pos)
+        if not item:
+            return
+
+        row_data = item.data(Qt.UserRole) or {}
+        row = item.row()
+        col = item.column()
+        cell_text = item.text()
+
+        # Keep row selected when context menu is invoked from a non-selected row.
+        self._table.selectRow(row)
+        self._table.setCurrentCell(row, col)
+
+        menu = QMenu(self)
+
+        copy_cell = QAction("Copy Cell", self)
+        copy_cell.triggered.connect(lambda: self._copy_to_clipboard(cell_text))
+        menu.addAction(copy_cell)
+
+        copy_row_json = QAction("Copy Row JSON", self)
+        copy_row_json.triggered.connect(
+            lambda: self._copy_to_clipboard(json.dumps(row_data, ensure_ascii=False, indent=2, default=str))
+        )
+        menu.addAction(copy_row_json)
+
+        menu.addSeparator()
+
+        explain_action = QAction("Explain Selected Row", self)
+        explain_action.triggered.connect(lambda: self.row_action_requested.emit("explain", row_data))
+        menu.addAction(explain_action)
+
+        menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _copy_to_clipboard(self, text: str):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(text)
 
     def get_visible_data(self) -> list[dict]:
         return list(self._filtered_data)
