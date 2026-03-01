@@ -1,5 +1,15 @@
 """
-Logging configuration - file + console handlers with rotation.
+app/logging_config.py
+
+Logging configuration — rotating file handler (main) + per-subsystem files.
+
+Log files written to %APPDATA%/IntuneDashboard/logs/:
+  intune_dashboard.log   ← everything (root logger)
+  ui.log                 ← app.ui.*
+  graph.log              ← app.graph.*
+  collector.log          ← app.collector.*
+  db.log                 ← app.db.*
+  context_menus.log      ← app.ui.widgets.context_menus (right-click actions)
 """
 
 import logging
@@ -7,43 +17,81 @@ import logging.handlers
 from pathlib import Path
 
 
-def setup_logging(log_level: str = "INFO"):
-    """Configure application logging."""
-    from app.config import LOGS_DIR
+# ─────────────────────────────────────────────────────────────────────────────
+# Formatters
+# ─────────────────────────────────────────────────────────────────────────────
 
-    log_file = LOGS_DIR / "intune_dashboard.log"
+_FILE_FMT = logging.Formatter(
+    "%(asctime)s [%(levelname)-8s] %(name)s:%(lineno)d - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+_CONSOLE_FMT = logging.Formatter(
+    "[%(levelname)-8s] %(name)s - %(message)s"
+)
 
-    # File handler with rotation
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=10 * 1024 * 1024,  # 10 MB
+
+def _rotating(path: Path, level: int = logging.DEBUG) -> logging.handlers.RotatingFileHandler:
+    h = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=10 * 1024 * 1024,   # 10 MB
         backupCount=5,
         encoding="utf-8",
     )
-    file_handler.setLevel(logging.DEBUG)
-    file_fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)-8s] %(name)s:%(lineno)d - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    file_handler.setFormatter(file_fmt)
+    h.setLevel(level)
+    h.setFormatter(_FILE_FMT)
+    return h
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    console_fmt = logging.Formatter(
-        "[%(levelname)-8s] %(name)s - %(message)s"
-    )
-    console_handler.setFormatter(console_fmt)
 
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
+# ─────────────────────────────────────────────────────────────────────────────
+# Public entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Suppress noisy libraries
+def setup_logging(log_level: str = "INFO"):
+    """
+    Configure application logging.
+
+    Call once from main.py before any other import that might log.
+    """
+    from app.config import LOGS_DIR
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # ── Main catch-all file ───────────────────────────────────────────────────
+    root.addHandler(_rotating(LOGS_DIR / "intune_dashboard.log"))
+
+    # ── Console (respects log_level arg) ─────────────────────────────────────
+    ch = logging.StreamHandler()
+    ch.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    ch.setFormatter(_CONSOLE_FMT)
+    root.addHandler(ch)
+
+    # ── Per-subsystem files ───────────────────────────────────────────────────
+    _add_subsystem("app.ui",                    LOGS_DIR / "ui.log")
+    _add_subsystem("app.graph",                 LOGS_DIR / "graph.log")
+    _add_subsystem("app.collector",             LOGS_DIR / "collector.log")
+    _add_subsystem("app.db",                    LOGS_DIR / "db.log")
+
+    # Suppress noisy third-party libs
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("msal").setLevel(logging.WARNING)
     logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
-    logging.getLogger(__name__).info(f"Logging initialized. Log file: {log_file}")
+    logging.getLogger(__name__).info(
+        f"Logging initialised — main log: {LOGS_DIR / 'intune_dashboard.log'}"
+    )
+
+
+def _add_subsystem(logger_name: str, path: Path):
+    """Attach a dedicated rotating file to a named logger (propagate stays True)."""
+    lgr = logging.getLogger(logger_name)
+    # Avoid duplicate handlers if setup_logging() is called more than once
+    if any(isinstance(h, logging.handlers.RotatingFileHandler) and
+           getattr(h, 'baseFilename', None) == str(path)
+           for h in lgr.handlers):
+        return
+    lgr.addHandler(_rotating(path))
