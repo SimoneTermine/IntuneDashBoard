@@ -232,8 +232,6 @@ class PolicyExplorerPage(QWidget):
         menu = _styled_menu(self)
         _section_header(menu, f"📦  {app_name}")
         if publisher:
-            meta = __import__("PySide6.QtGui", fromlist=["QAction"]).QAction
-            from PySide6.QtWidgets import QMenu
             from PySide6.QtGui import QAction
             pub_act = QAction(f"    by {publisher}", menu)
             pub_act.setEnabled(False)
