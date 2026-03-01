@@ -129,6 +129,30 @@ def _export_csv(data: dict, parent=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Datetime helper (mirrors app/collector/devices.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_dt(val) -> "Optional[datetime]":
+    """Parse an ISO-8601 string from Graph API into a Python datetime.
+    SQLite/SQLAlchemy requires a real datetime object, not a string.
+    Handles formats like '2026-02-25T17:19:57.4793576Z'.
+    """
+    if val is None or not isinstance(val, str):
+        return val  # already a datetime or None — pass through
+    try:
+        return datetime.fromisoformat(val.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            # Fallback: strip sub-second to 6 digits (Python max) and retry
+            import re
+            val2 = re.sub(r"(\.\d{6})\d+", r"", val).replace("Z", "+00:00")
+            return datetime.fromisoformat(val2)
+        except Exception:
+            logger.warning(f"Could not parse datetime string: {val!r}")
+            return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Intune / Entra portal URL builders
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -139,32 +163,168 @@ def _url_device_intune(device_id: str) -> str:
     )
 
 
-def _url_device_entra(device_id: str) -> str:
-    # Entra uses the Entra object ID, not Intune device ID.
-    # We open the Entra devices search as best-effort fallback.
-    return (
-        "https://entra.microsoft.com/#view/Microsoft_AAD_Devices"
-        "/DevicesMenuBlade/~/AllDevices"
-    )
+def _open_entra_device(intune_device_id: str, parent_widget) -> None:
+    """
+    Open the correct Entra portal page for a device.
 
+    The Entra portal deep-link requires the Entra **Object ID** (device.id from
+    the Entra /devices endpoint), which is DIFFERENT from:
+      - The Intune managed device ID  (stored as Device.id in our DB)
+      - The Azure AD Device ID        (stored as Device.azure_ad_device_id, = Entra deviceId)
 
-def _url_policy_intune(policy_id: str, policy_type: str = "") -> str:
-    pt = policy_type.lower()
-    if "compliance" in pt:
-        return (
-            "https://intune.microsoft.com/#view/Microsoft_Intune_DeviceSettings"
-            f"/DevicesCompliancePolicyOverview.ReactView/policyId/{policy_id}"
+    Strategy:
+      1. Read azure_ad_device_id from local DB  (fast, no network)
+      2. Live-query Graph:  GET /devices?$filter=deviceId eq '{azureADDeviceId}'&$select=id
+         to get the true Entra Object ID.
+      3. Open the deep-link with the Object ID.
+      4. On any failure (no permission, not in Entra, offline), open the list page.
+    """
+    try:
+        from app.db.database import session_scope
+        from app.db.models import Device
+        with session_scope() as db:
+            row = db.query(Device.azure_ad_device_id).filter(
+                Device.id == intune_device_id
+            ).first()
+            azure_ad_device_id = row[0] if row and row[0] else None
+    except Exception as e:
+        logger.debug(f"Entra: DB lookup failed for {intune_device_id}: {e}")
+        azure_ad_device_id = None
+
+    if not azure_ad_device_id:
+        logger.debug(f"Entra: no azure_ad_device_id for {intune_device_id} — opening list")
+        webbrowser.open(
+            "https://entra.microsoft.com/#view/Microsoft_AAD_Devices/DevicesMenuBlade/~/AllDevices"
         )
-    elif "settings_catalog" in pt or "settings catalog" in pt:
-        return (
-            "https://intune.microsoft.com/#view/Microsoft_Intune_DeviceSettings"
-            f"/PolicySummaryBlade/policyId/{policy_id}/policyType/configurationPolicy"
+        return
+
+    # Live Graph query to get the Entra Object ID from the Azure AD Device ID
+    try:
+        from app.graph.client import get_client
+        client = get_client()
+        resp = client.get(
+            "devices",
+            params={
+                "$filter": f"deviceId eq '{azure_ad_device_id}'",
+                "$select": "id,displayName",
+            },
         )
+        items = resp.get("value", [])
+        entra_object_id = items[0]["id"] if items else None
+    except Exception as e:
+        logger.debug(f"Entra: Graph lookup failed for azureADDeviceId={azure_ad_device_id}: {e}")
+        entra_object_id = None
+
+    if entra_object_id:
+        url = (
+            "https://entra.microsoft.com/#view/Microsoft_AAD_Devices"
+            f"/DeviceDetailsMenuBlade/~/Properties/objectId/{entra_object_id}"
+        )
+        logger.debug(f"Entra: opening {url}")
     else:
-        return (
-            "https://intune.microsoft.com/#view/Microsoft_Intune_DeviceSettings"
-            f"/PolicySummaryBlade/policyId/{policy_id}/policyType/deviceConfiguration"
+        logger.debug(
+            f"Entra: Object ID not found for azureADDeviceId={azure_ad_device_id} "
+            f"(may need Device.Read.All permission) — opening list"
         )
+        url = "https://entra.microsoft.com/#view/Microsoft_AAD_Devices/DevicesMenuBlade/~/AllDevices"
+
+    webbrowser.open(url)
+
+
+# Platform name normalisation: Control.platform / raw_json "platforms" → URL segment
+_PLATFORM_MAP = {
+    "windows":   "windows10",
+    "windows10": "windows10",
+    "ios":       "iOS",
+    "android":   "android",
+    "macos":     "macOS",
+    "osx":       "macOS",
+    "all":       "windows10",   # safe fallback
+}
+
+
+def _norm_platform(raw_platform: str) -> str:
+    """Normalise a stored platform value to the Intune portal URL segment."""
+    if not raw_platform:
+        return "windows10"
+    # raw_platform can be comma-separated (e.g. "windows10,macOS") — take first
+    first = raw_platform.split(",")[0].strip().lower()
+    return _PLATFORM_MAP.get(first, first)
+
+
+def _open_policy_portal(policy_id: str, policy_type: str, parent_widget) -> None:
+    """
+    Open the Intune portal page for a policy.
+
+    PolicySummaryBlade requires: isAssigned~ / technology / templateId / platformName
+    (the old policyType parameter no longer works and causes "missing parameter" errors).
+
+    Values are read from Control.raw_json stored at sync time.
+    Fallback: open the Intune policy list so the user is never left with nothing.
+    """
+    import json as _json
+
+    is_assigned_str = "true"
+    technology = "mdm"
+    template_id = ""
+    platform = "windows10"
+
+    try:
+        from app.db.database import session_scope
+        from app.db.models import Control
+
+        with session_scope() as db:
+            ctrl = db.get(Control, policy_id)
+            if ctrl:
+                is_assigned_str = "true" if ctrl.is_assigned else "false"
+                platform = _norm_platform(ctrl.platform or "")
+                raw = {}
+                if ctrl.raw_json:
+                    try:
+                        raw = _json.loads(ctrl.raw_json) if isinstance(ctrl.raw_json, str) else ctrl.raw_json
+                    except Exception:
+                        pass
+                # settings_catalog / endpoint_security (beta API) have platforms+technologies
+                if raw.get("platforms"):
+                    platform = _norm_platform(raw["platforms"])
+                if raw.get("technologies"):
+                    # technologies can be "mdm,microsoftSense" — take the first token
+                    technology = raw["technologies"].split(",")[0].strip()
+                tmpl = raw.get("templateReference") or {}
+                if isinstance(tmpl, dict):
+                    template_id = tmpl.get("templateId", "") or ""
+
+                # Classic config_policy (deviceConfigurations, v1.0 API) does NOT have
+                # platforms/technologies in raw_json — infer platform from @odata.type.
+                # This also handles cases where _infer_platform() returned "unknown".
+                if not raw.get("platforms") and raw.get("@odata.type"):
+                    odata_lower = raw["@odata.type"].lower()
+                    if "ios" in odata_lower:
+                        platform = "iOS"
+                    elif "android" in odata_lower:
+                        platform = "android"
+                    elif "macos" in odata_lower or "osx" in odata_lower:
+                        platform = "macOS"
+                    elif "windows" in odata_lower:
+                        platform = "windows10"
+                    # technology stays "mdm" — correct for all classic config policies
+
+                # compliance_policy: technology is "mdm", no templateId, platform from
+                # @odata.type (e.g. #microsoft.graph.windows10CompliancePolicy → windows10).
+                # The defaults above handle this correctly.
+    except Exception as e:
+        logger.debug(f"Policy portal DB lookup failed for {policy_id}: {e}")
+
+    url = (
+        "https://intune.microsoft.com/#view/Microsoft_Intune_Workflows"
+        f"/PolicySummaryBlade/policyId/{policy_id}"
+        f"/isAssigned~/{is_assigned_str}"
+        f"/technology/{technology}"
+        f"/templateId/{template_id}"
+        f"/platformName/{platform}"
+    )
+    logger.debug(f"Opening policy portal: {url}")
+    webbrowser.open(url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,32 +342,41 @@ class _DeviceSyncWorker(QThread):
         try:
             from app.config import AppConfig
             from app.db.database import session_scope
-            from app.db.models import ManagedDevice
-            from app.graph.auth import get_token
-            from app.graph.client import GraphClient
+            from app.db.models import Device
+            from app.graph.client import get_client
 
             cfg = AppConfig()
             if cfg.demo_mode:
                 self.done.emit(False, "demo_mode")
                 return
 
-            token = get_token()
-            if not token:
+            # get_client() reuses the authenticated singleton — no extra auth flow needed
+            try:
+                client = get_client()
+            except Exception:
                 self.done.emit(False, "no_token")
                 return
 
-            client = GraphClient(token)
-            dev_data = client.get(
-                f"deviceManagement/managedDevices/{self._device_id}"
-            )
+            try:
+                dev_data = client.get(
+                    f"deviceManagement/managedDevices/{self._device_id}"
+                )
+            except Exception as e:
+                status_code = getattr(e, "status_code", 0)
+                if status_code == 404:
+                    self.done.emit(False, "not_found")
+                else:
+                    self.done.emit(False, str(e))
+                return
+
             if not dev_data:
                 self.done.emit(False, "not_found")
                 return
 
             with session_scope() as db:
                 dev = (
-                    db.query(ManagedDevice)
-                    .filter(ManagedDevice.device_id == self._device_id)
+                    db.query(Device)
+                    .filter(Device.id == self._device_id)
                     .first()
                 )
                 if dev:
@@ -215,13 +384,21 @@ class _DeviceSyncWorker(QThread):
                     dev.compliance_state = dev_data.get(
                         "complianceState", dev.compliance_state
                     )
-                    dev.last_sync_datetime = dev_data.get("lastSyncDateTime")
+                    dev.last_sync_date_time = _parse_dt(dev_data.get("lastSyncDateTime"))
                     dev.os_version = dev_data.get("osVersion", dev.os_version)
-                    dev.last_updated = datetime.utcnow()
+                    dev.synced_at = datetime.utcnow()
+                    logger.info(
+                        f"Force-synced device {dev.device_name} ({self._device_id[:8]}…)"
+                    )
+                else:
+                    logger.warning(
+                        f"Device {self._device_id} not in local DB after Graph fetch"
+                    )
 
             name = dev_data.get("deviceName", self._device_id)
             self.done.emit(True, name)
         except Exception as e:
+            logger.error(f"Force sync failed for {self._device_id}: {e}", exc_info=True)
             self.done.emit(False, str(e))
 
 
@@ -526,22 +703,22 @@ class DriftDetailDialog(QDialog):
 
         try:
             from app.db.database import session_scope
-            from app.db.models import SnapshotControl
+            from app.db.models import SnapshotItem
 
             with session_scope() as db:
                 bl = (
-                    db.query(SnapshotControl)
+                    db.query(SnapshotItem)
                     .filter(
-                        SnapshotControl.snapshot_id == self._baseline_id,
-                        SnapshotControl.entity_id == entity_id,
+                        SnapshotItem.snapshot_id == self._baseline_id,
+                        SnapshotItem.entity_id == entity_id,
                     )
                     .first()
                 )
                 cu = (
-                    db.query(SnapshotControl)
+                    db.query(SnapshotItem)
                     .filter(
-                        SnapshotControl.snapshot_id == self._current_id,
-                        SnapshotControl.entity_id == entity_id,
+                        SnapshotItem.snapshot_id == self._current_id,
+                        SnapshotItem.entity_id == entity_id,
                     )
                     .first()
                 )
@@ -549,7 +726,7 @@ class DriftDetailDialog(QDialog):
             def _render(ctrl) -> str:
                 if ctrl is None:
                     return "(Not present in this snapshot)"
-                raw = ctrl.raw_json
+                raw = ctrl.raw_snapshot_json
                 if raw is None:
                     return "(No raw data stored)"
                 if isinstance(raw, str):
@@ -573,22 +750,32 @@ class DriftDetailDialog(QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PolicyDevicesDialog(QDialog):
-    """Shows devices that have a compliance status record for this policy."""
+    """
+    Shows devices affected by a policy.
 
-    def __init__(self, policy_id: str, policy_name: str, parent=None):
+    Strategy depends on policy type:
+      - compliance_policy   → query DeviceComplianceStatus (per-device evaluation state)
+      - all other types     → query Assignment → DeviceGroupMembership → Device
+                              (which devices are in scope via group targeting)
+    """
+
+    def __init__(self, policy_id: str, policy_name: str, policy_type: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Devices — {policy_name}")
-        self.resize(820, 500)
+        self.resize(860, 520)
         self._policy_id = policy_id
         self._policy_name = policy_name
+        self._policy_type = (policy_type or "").lower()
+        self._is_compliance = "compliance" in self._policy_type
         self._setup_ui()
         self._load()
 
     def _setup_ui(self):
         lay = QVBoxLayout(self)
+        mode = "compliance evaluation" if self._is_compliance else "group targeting"
         lbl = QLabel(
-            f"Devices with a compliance record for  "
-            f"<b style='color:#cba6f7'>{self._policy_name}</b>"
+            f"Devices for  <b style='color:#cba6f7'>{self._policy_name}</b>"
+            f"  <span style='color:#a6adc8;font-size:11px'>({mode})</span>"
         )
         lbl.setTextFormat(Qt.RichText)
         lbl.setWordWrap(True)
@@ -596,20 +783,28 @@ class PolicyDevicesDialog(QDialog):
 
         from PySide6.QtWidgets import QTableWidget, QAbstractItemView
         self._tbl = QTableWidget()
-        self._tbl.setColumnCount(4)
-        self._tbl.setHorizontalHeaderLabels(["Device Name", "Status", "User", "Last Report"])
+        if self._is_compliance:
+            self._tbl.setColumnCount(4)
+            self._tbl.setHorizontalHeaderLabels(["Device Name", "Status", "User", "Last Report"])
+            self._tbl.setColumnWidth(1, 110)
+            self._tbl.setColumnWidth(2, 200)
+            self._tbl.setColumnWidth(3, 140)
+        else:
+            self._tbl.setColumnCount(4)
+            self._tbl.setHorizontalHeaderLabels(["Device Name", "OS", "User", "Via Group"])
+            self._tbl.setColumnWidth(1, 90)
+            self._tbl.setColumnWidth(2, 180)
+            self._tbl.setColumnWidth(3, 200)
         self._tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._tbl.setAlternatingRowColors(True)
         self._tbl.verticalHeader().setVisible(False)
         self._tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._tbl.setColumnWidth(1, 110)
-        self._tbl.setColumnWidth(2, 200)
-        self._tbl.setColumnWidth(3, 140)
         lay.addWidget(self._tbl)
 
         self._info = QLabel("")
         self._info.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        self._info.setWordWrap(True)
         lay.addWidget(self._info)
 
         btns = QDialogButtonBox(QDialogButtonBox.Close)
@@ -617,65 +812,172 @@ class PolicyDevicesDialog(QDialog):
         lay.addWidget(btns)
 
     def _load(self):
+        if self._is_compliance:
+            self._load_compliance()
+        else:
+            self._load_via_assignments()
+
+    def _load_compliance(self):
+        """Load per-device compliance evaluation state (compliance_policy only)."""
         try:
             from app.db.database import session_scope
-            from app.db.models import DeviceComplianceStatus, ManagedDevice
+            from app.db.models import DeviceComplianceStatus, Device, Control
             from PySide6.QtWidgets import QTableWidgetItem
 
             STATUS_COLORS = {
-                "compliant": "#a6e3a1",
-                "noncompliant": "#f38ba8",
-                "error": "#fab387",
-                "conflict": "#f9e2af",
-                "unknown": "#a6adc8",
-                "inGracePeriod": "#f9e2af",
+                "compliant":     "#a6e3a1",
+                "noncompliant":  "#f38ba8",
+                "error":         "#fab387",
+                "conflict":      "#f9e2af",
+                "unknown":       "#a6adc8",
+                "ingraceperiod": "#f9e2af",
+                "notapplicable": "#6c7086",
             }
 
             with session_scope() as db:
+                # Primary lookup: policy_id == Control.id
                 rows = (
                     db.query(DeviceComplianceStatus)
                     .filter(DeviceComplianceStatus.policy_id == self._policy_id)
                     .order_by(DeviceComplianceStatus.status)
                     .all()
                 )
+
+                # Fallback: compliance_status.py sometimes stores the raw Graph state_id
+                # as policy_id when the display-name→control-id mapping failed.
+                # Match by policy_display_name using the control's display_name.
+                if not rows:
+                    ctrl = db.get(Control, self._policy_id)
+                    if ctrl and ctrl.display_name:
+                        rows = (
+                            db.query(DeviceComplianceStatus)
+                            .filter(
+                                DeviceComplianceStatus.policy_display_name == ctrl.display_name
+                            )
+                            .order_by(DeviceComplianceStatus.status)
+                            .all()
+                        )
+                        if rows:
+                            logger.debug(
+                                f"PolicyDevicesDialog compliance: matched {len(rows)} rows "
+                                f"via display_name fallback for {self._policy_id}"
+                            )
+
                 result = []
                 for r in rows:
-                    dev = (
-                        db.query(ManagedDevice)
-                        .filter(ManagedDevice.device_id == r.device_id)
-                        .first()
-                    )
-                    result.append(
-                        {
-                            "name": dev.device_name if dev else r.device_id,
-                            "status": r.status or "unknown",
-                            "user": r.user_principal_name or r.user_name or "—",
-                            "last_report": (
-                                r.last_report_datetime.strftime("%Y-%m-%d %H:%M")
-                                if r.last_report_datetime
-                                else "—"
-                            ),
-                        }
-                    )
+                    dev = db.query(Device).filter(Device.id == r.device_id).first()
+                    status_key = (r.status or "unknown").lower()
+                    result.append({
+                        "name": dev.device_name if dev else r.device_id,
+                        "status": r.status or "unknown",
+                        "status_key": status_key,
+                        "user": r.user_principal_name or r.user_name or "—",
+                        "last_report": (
+                            r.last_report_datetime.strftime("%Y-%m-%d %H:%M")
+                            if r.last_report_datetime else "—"
+                        ),
+                    })
 
             self._tbl.setRowCount(len(result))
             for i, row in enumerate(result):
                 self._tbl.setItem(i, 0, QTableWidgetItem(row["name"]))
                 st_item = QTableWidgetItem(row["status"])
-                st_item.setForeground(
-                    QColor(STATUS_COLORS.get(row["status"], "#a6adc8"))
-                )
+                st_item.setForeground(QColor(STATUS_COLORS.get(row["status_key"], "#a6adc8")))
                 self._tbl.setItem(i, 1, st_item)
                 self._tbl.setItem(i, 2, QTableWidgetItem(row["user"]))
                 self._tbl.setItem(i, 3, QTableWidgetItem(row["last_report"]))
 
-            self._info.setText(
-                f"{len(result)} device record(s) found for this policy."
-                if result
-                else "No compliance records found. Run a sync to populate data."
-            )
+            if result:
+                self._info.setText(f"{len(result)} device compliance record(s) found.")
+            else:
+                self._info.setText(
+                    "No per-device compliance records found for this policy.  "
+                    "The compliance_status sync must complete at least once after a full sync."
+                )
         except Exception as e:
-            self._info.setText(f"Error loading data: {e}")
+            logger.error(f"PolicyDevicesDialog._load_compliance error: {e}", exc_info=True)
+            self._info.setText(f"Error loading compliance data: {e}")
+
+    def _load_via_assignments(self):
+        """
+        Load devices in scope for config / settings_catalog / endpoint_security policies.
+
+        Chain: Assignment (include) → group_id → DeviceGroupMembership → Device
+        allDevices / allUsers assignments are shown as a note, not as a device list.
+        """
+        try:
+            from app.db.database import session_scope
+            from app.db.models import Assignment, Device, DeviceGroupMembership, Group
+            from PySide6.QtWidgets import QTableWidgetItem
+
+            with session_scope() as db:
+                assignments = (
+                    db.query(Assignment)
+                    .filter(
+                        Assignment.control_id == self._policy_id,
+                        Assignment.intent == "include",
+                    )
+                    .all()
+                )
+
+                all_devices_targeted = any(
+                    a.target_type in ("allDevices", "allUsers") for a in assignments
+                )
+                group_ids = [
+                    a.target_id for a in assignments
+                    if a.target_type == "group" and a.target_id
+                ]
+
+                # Group name map
+                group_names: dict[str, str] = {}
+                if group_ids:
+                    grps = db.query(Group).filter(Group.id.in_(group_ids)).all()
+                    group_names = {g.id: (g.display_name or g.id) for g in grps}
+
+                # Device lookup via DeviceGroupMembership
+                result = []
+                seen_device_ids: set[str] = set()
+                for gid in group_ids:
+                    memberships = (
+                        db.query(DeviceGroupMembership)
+                        .filter(DeviceGroupMembership.group_id == gid)
+                        .all()
+                    )
+                    for m in memberships:
+                        if m.device_id in seen_device_ids:
+                            continue
+                        seen_device_ids.add(m.device_id)
+                        dev = db.get(Device, m.device_id)
+                        if dev:
+                            result.append({
+                                "name": dev.device_name or dev.id,
+                                "os": dev.operating_system or "—",
+                                "user": dev.user_principal_name or "—",
+                                "group": group_names.get(gid, gid),
+                            })
+
+            self._tbl.setRowCount(len(result))
+            for i, row in enumerate(result):
+                self._tbl.setItem(i, 0, QTableWidgetItem(row["name"]))
+                self._tbl.setItem(i, 1, QTableWidgetItem(row["os"]))
+                self._tbl.setItem(i, 2, QTableWidgetItem(row["user"]))
+                self._tbl.setItem(i, 3, QTableWidgetItem(row["group"]))
+
+            notes = []
+            if all_devices_targeted:
+                notes.append("⚠️  Policy targets All Devices or All Users — not all devices are listed here.")
+            if result:
+                notes.append(f"{len(result)} device(s) found via group membership.")
+            elif not all_devices_targeted:
+                notes.append(
+                    "No devices found via group memberships. "
+                    "Run a full sync (including the 'memberships' step) to populate group membership data."
+                )
+            self._info.setText("  ".join(notes))
+
+        except Exception as e:
+            logger.error(f"PolicyDevicesDialog._load_via_assignments error: {e}", exc_info=True)
+            self._info.setText(f"Error loading assignment data: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -777,7 +1079,7 @@ def build_device_context_menu(
     menu.addAction(act_intune)
 
     act_entra = QAction("🌐  Open in Entra Portal", menu)
-    act_entra.triggered.connect(lambda: webbrowser.open(_url_device_entra(device_id)))
+    act_entra.triggered.connect(lambda: _open_entra_device(device_id, parent_widget))
     menu.addAction(act_entra)
 
     menu.addSeparator()
@@ -839,16 +1141,16 @@ def build_policy_context_menu(
     menu.addAction(meta)
     menu.addSeparator()
 
-    # ── Assigned devices (compliance only) ───────────────────────────────────
+    # ── Assigned devices ──────────────────────────────────────────────────────
+    # Works for all policy types: compliance uses DeviceComplianceStatus;
+    # config/settings_catalog/endpoint_security use Assignment targets.
     act_devices = QAction("🖥️  Show Assigned Devices", menu)
-    if policy_id and "compliance" in policy_type.lower():
+    if policy_id:
         act_devices.triggered.connect(
-            lambda: PolicyDevicesDialog(policy_id, policy_name, parent_widget).exec()
+            lambda: PolicyDevicesDialog(policy_id, policy_name, policy_type, parent_widget).exec()
         )
     else:
-        act_devices.setEnabled(bool(policy_id))
-        if policy_id and "compliance" not in policy_type.lower():
-            act_devices.setToolTip("Available for compliance policies only")
+        act_devices.setEnabled(False)
     menu.addAction(act_devices)
 
     # ── Policy diff ───────────────────────────────────────────────────────────
@@ -889,7 +1191,7 @@ def build_policy_context_menu(
     act_intune = QAction("🌐  Open in Intune Portal", menu)
     if policy_id:
         act_intune.triggered.connect(
-            lambda: webbrowser.open(_url_policy_intune(policy_id, policy_type))
+            lambda: _open_policy_portal(policy_id, policy_type, parent_widget)
         )
     else:
         act_intune.setEnabled(False)
@@ -922,15 +1224,15 @@ def _enrich_policy(policy: dict) -> dict:
     """Try to add raw_json data from DB to supplement the table row dict."""
     try:
         from app.db.database import session_scope
-        from app.db.models import ComplianceControl
+        from app.db.models import Control
 
         pid = policy.get("id", "")
         if not pid:
             return policy
         with session_scope() as db:
             row = (
-                db.query(ComplianceControl)
-                .filter(ComplianceControl.control_id == pid)
+                db.query(Control)
+                .filter(Control.id == pid)
                 .first()
             )
             if row and row.raw_json:
@@ -1019,20 +1321,16 @@ def _confirm_delete_snapshot(snap_id, snap_name, parent, on_delete):
     if reply == QMessageBox.Yes:
         try:
             from app.db.database import session_scope
-            from app.db.models import GovernanceSnapshot, SnapshotControl, SnapshotAssignment
+            from app.db.models import Snapshot, SnapshotItem
 
             with session_scope() as db:
-                db.query(SnapshotControl).filter(
-                    SnapshotControl.snapshot_id == snap_id
-                ).delete()
-                db.query(SnapshotAssignment).filter(
-                    SnapshotAssignment.snapshot_id == snap_id
-                ).delete(synchronize_session=False) if hasattr(
-                    __builtins__, "__import__"
-                ) else None
-                db.query(GovernanceSnapshot).filter(
-                    GovernanceSnapshot.id == snap_id
-                ).delete()
+                # Delete child items first (cascade may not fire on bulk delete)
+                db.query(SnapshotItem).filter(
+                    SnapshotItem.snapshot_id == snap_id
+                ).delete(synchronize_session=False)
+                db.query(Snapshot).filter(
+                    Snapshot.id == snap_id
+                ).delete(synchronize_session=False)
             on_delete(snap_id)
         except Exception as e:
             QMessageBox.warning(parent, "Delete Failed", f"Could not delete snapshot:\n{e}")

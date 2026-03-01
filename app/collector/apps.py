@@ -1,16 +1,15 @@
 """
+app/collector/apps.py
+
 Collector for Intune managed apps and per-device install status.
 
 Graph API notes on app deviceStatuses:
-  - The /deviceStatuses sub-endpoint is available only for certain app types
-    AND only when the app has been deployed to at least one device in a way
-    that Intune tracks install state.
-  - Even win32LobApp can return 400 if the app has no tracked device installs
-    (e.g. app assigned but no device has ever reported status).
-  - Strategy: attempt for known-supported types; treat ALL errors as non-fatal
-    DEBUG messages, not warnings, since this is a best-effort enrichment.
-  - Fallback: use /installSummary (aggregate only) for unsupported types
-    to at least record total installed/failed counts.
+  - The /deviceStatuses sub-endpoint is available for most app types via the beta API.
+    Errors (400/404) are silenced at DEBUG level — this is best-effort enrichment.
+  - win32LobApp and windowsMobileMSI use /deviceInstallStates (different endpoint).
+  - winGetApp, officeSuiteApp, and most store/LOB types use /deviceStatuses.
+  - Even supported types can 400 if the app has no tracked device installs yet.
+  - No hard cap on number of apps processed — all synced apps are attempted.
 """
 
 import json
@@ -24,25 +23,39 @@ from app.graph.client import GraphClient, GraphError
 from app.graph.endpoints import (
     MOBILE_APPS,
     APP_DEVICE_STATUSES,
+    APP_WIN32_INSTALL_STATES,
     APP_SELECT_FIELDS,
 )
 
 logger = logging.getLogger(__name__)
 
-# Types where per-device /deviceStatuses MAY be available
+# Types where per-device status is fetched via /deviceStatuses (beta)
 DEVICE_STATUS_SUPPORTED_TYPES = {
-    "win32LobApp",
-    "windowsMobileMSI",
-    "microsoftStoreForBusinessApp",
-    "microsoftStoreForBusinessContainedApp",
+    # WinGet (modern Windows package manager — most common in current tenants)
+    "winGetApp",
+    # iOS / Android LOB and Store
     "iosLobApp",
     "androidLobApp",
     "managedIOSStoreApp",
     "managedAndroidStoreApp",
     "managedIOSLobApp",
     "managedAndroidLobApp",
+    # Windows Store apps
+    "microsoftStoreForBusinessApp",
+    "microsoftStoreForBusinessContainedApp",
     "windowsUniversalAppX",
     "windowsAppX",
+    "windowsStoreApp",
+    # Office suite
+    "officeSuiteApp",
+    # Web apps (install state tracked by Intune)
+    "webApp",
+}
+
+# Types that use /deviceInstallStates instead of /deviceStatuses
+WIN32_INSTALL_STATE_TYPES = {
+    "win32LobApp",
+    "windowsMobileMSI",
 }
 
 
@@ -99,10 +112,14 @@ class AppCollector:
 
     def _sync_install_statuses(self):
         """
-        Best-effort: fetch per-device install status for supported app types.
-        All errors are DEBUG-level — this is supplementary data, not critical.
-        If /deviceStatuses fails (even for supported types), the app still
-        syncs correctly; just without per-device install detail.
+        Best-effort: fetch per-device install status for all supported app types.
+
+        Uses two endpoints depending on app type:
+          - /deviceStatuses      → winGetApp, LOB, Store apps
+          - /deviceInstallStates → win32LobApp, windowsMobileMSI
+
+        All errors are DEBUG-level only — failures here do not affect app metadata sync.
+        No cap on number of apps processed.
         """
         logger.info("Syncing app device install statuses (best-effort)...")
 
@@ -112,44 +129,71 @@ class AppCollector:
         synced = 0
         skipped = 0
 
-        for app_id, app_type in apps[:50]:
-            if app_type not in DEVICE_STATUS_SUPPORTED_TYPES:
+        for app_id, app_type in apps:
+            if app_type in WIN32_INSTALL_STATE_TYPES:
+                # Win32/MSI apps use a different endpoint
+                self._sync_win32_statuses(app_id, app_type)
+                synced += 1
+            elif app_type in DEVICE_STATUS_SUPPORTED_TYPES:
+                self._sync_device_statuses(app_id, app_type)
+                synced += 1
+            else:
                 skipped += 1
-                continue
-            try:
-                # Use /deviceStatuses (beta) for per-device install status.
-                # Some tenants/app types still return 400/404 — that's expected and handled as best-effort.
-                endpoint = APP_DEVICE_STATUSES.format(app_id=app_id)
-                statuses = self.client.get_all(
-                    endpoint,
-                    params={
-                        "$select": "id,deviceId,deviceName,displayVersion,"
-                                   "installState,errorCode,lastSyncDateTime,"
-                                   "userPrincipalName,userName"
-                    },
-                    api_version="beta",
-                )
-                with session_scope() as db:
-                    for raw in statuses:
-                        self._upsert_device_app_status(db, raw, app_id)
-                synced += len(statuses)
-                logger.debug(f"App {app_id} ({app_type}): {len(statuses)} device statuses")
-            except GraphError as e:
-                # Non-fatal best-effort enrichment.
-                # Reduce noise for the common "segment not found" cases.
-                msg = str(e)
-                if e.status_code in (400, 404) and "deviceStatuses" in msg and "segment" in msg:
-                    logger.debug(
-                        f"App {app_id} ({app_type}): per-device install status not available via Graph in this tenant/app. Skipping."
-                    )
-                else:
-                    logger.debug(f"App {app_id} ({app_type}): per-device install status fetch failed: {e}")
-            except Exception as e:
-                logger.debug(f"App {app_id} ({app_type}): per-device install status fetch failed: {e}")
 
         logger.info(
-            f"App install statuses: {synced} synced, {skipped} skipped (unsupported type)"
+            f"App install statuses: {synced} attempted, {skipped} skipped (unsupported type)"
         )
+
+    def _sync_device_statuses(self, app_id: str, app_type: str):
+        """Fetch per-device install status via /deviceStatuses (beta)."""
+        try:
+            endpoint = APP_DEVICE_STATUSES.format(app_id=app_id)
+            statuses = self.client.get_all(
+                endpoint,
+                params={
+                    "$select": "id,deviceId,deviceName,displayVersion,"
+                               "installState,errorCode,lastSyncDateTime,"
+                               "userPrincipalName,userName"
+                },
+                api_version="beta",
+            )
+            with session_scope() as db:
+                for raw in statuses:
+                    self._upsert_device_app_status(db, raw, app_id)
+            if statuses:
+                logger.debug(f"App {app_id} ({app_type}): {len(statuses)} device statuses")
+        except GraphError as e:
+            msg = str(e)
+            if e.status_code in (400, 404) and ("deviceStatuses" in msg or "segment" in msg):
+                logger.debug(
+                    f"App {app_id} ({app_type}): /deviceStatuses not available — skipping"
+                )
+            else:
+                logger.debug(f"App {app_id} ({app_type}): /deviceStatuses failed: {e}")
+        except Exception as e:
+            logger.debug(f"App {app_id} ({app_type}): install status fetch failed: {e}")
+
+    def _sync_win32_statuses(self, app_id: str, app_type: str):
+        """Fetch per-device install status via /deviceInstallStates (Win32/MSI)."""
+        try:
+            endpoint = APP_WIN32_INSTALL_STATES.format(app_id=app_id)
+            statuses = self.client.get_all(
+                endpoint,
+                params={
+                    "$select": "id,deviceId,deviceName,installState,errorCode,lastSyncDateTime"
+                },
+                api_version="beta",
+            )
+            with session_scope() as db:
+                for raw in statuses:
+                    # /deviceInstallStates uses "deviceId" field same as /deviceStatuses
+                    self._upsert_device_app_status(db, raw, app_id)
+            if statuses:
+                logger.debug(f"App {app_id} ({app_type}): {len(statuses)} win32 install states")
+        except GraphError as e:
+            logger.debug(f"App {app_id} ({app_type}): /deviceInstallStates failed: {e}")
+        except Exception as e:
+            logger.debug(f"App {app_id} ({app_type}): win32 install state fetch failed: {e}")
 
     def _upsert_device_app_status(self, db, raw: dict, app_id: str):
         device_id = raw.get("deviceId", "")
