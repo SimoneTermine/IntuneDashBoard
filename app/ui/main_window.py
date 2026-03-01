@@ -18,7 +18,7 @@ from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from app.ui.pages import (
     OverviewPage, DeviceExplorerPage, DeviceDetailPage,
     PolicyExplorerPage, ExplainabilityPage, AppOpsPage,
-    GovernancePage, GroupUsagePage, SettingsPage,
+    GovernancePage, GroupUsagePage, SettingsPage, GraphQueryPage,
 )
 from app.ui.widgets.sync_status_widget import SyncStatusWidget
 
@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
             (None, "ANALYSIS", None, True),
             ("🔍", "Explain State", "explain", False),
             ("📦", "App Ops", "app_ops", False),
+            ("🧪", "Graph Query Lab", "graph_query", False),
 
             (None, "GOVERNANCE", None, True),
             ("📈", "Drift & Snapshots", "governance", False),
@@ -198,6 +199,7 @@ class MainWindow(QMainWindow):
         self._pages["group_usage"] = GroupUsagePage()
         self._pages["explain"] = ExplainabilityPage()
         self._pages["app_ops"] = AppOpsPage()
+        self._pages["graph_query"] = GraphQueryPage()
         self._pages["governance"] = GovernancePage()
         self._pages["settings"] = SettingsPage()
 
