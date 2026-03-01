@@ -1,18 +1,24 @@
 """
+app/ui/widgets/filterable_table.py
+
 Filterable, sortable table widget.
 Wraps QTableWidget with column config and quick-filter.
+
+Changes vs original:
+  • set_context_menu_handler(fn)  — wire a right-click handler
+  • set_multi_select(bool)        — switch between Single / Extended selection
+  • get_selected_rows() → list[dict]  — return all selected row dicts
 """
 
-import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable, Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QLabel, QLineEdit, QPushButton, QAbstractItemView, QMenu,
+    QHeaderView, QLabel, QLineEdit, QPushButton, QAbstractItemView,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QAction
+from PySide6.QtGui import QColor
 
 
 COMPLIANCE_COLORS = {
@@ -38,15 +44,15 @@ class FilterableTable(QWidget):
     Columns: list of (key, header_label, width) tuples.
     """
 
-    row_selected = Signal(int, dict)  # row index, row data dict
+    row_selected = Signal(int, dict)   # row index, row data dict
     export_requested = Signal()
-    row_action_requested = Signal(str, dict)  # action name, row data
 
     def __init__(self, columns: list[tuple], parent=None):
         super().__init__(parent)
         self._columns = columns
         self._all_data: list[dict] = []
         self._filtered_data: list[dict] = []
+        self._context_menu_handler: Optional[Callable] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -54,10 +60,11 @@ class FilterableTable(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # Toolbar row
+        # ── Toolbar ──────────────────────────────────────────────────────────
         toolbar = QHBoxLayout()
+
         self._search_box = QLineEdit()
-        self._search_box.setPlaceholderText("🔍  Filter table...")
+        self._search_box.setPlaceholderText("🔍  Filter table…")
         self._search_box.setClearButtonEnabled(True)
         self._search_box.textChanged.connect(self._apply_filter)
         self._search_box.setMaximumWidth(300)
@@ -67,7 +74,6 @@ class FilterableTable(QWidget):
 
         self._export_btn = QPushButton("Export CSV")
         self._export_btn.setMaximumWidth(110)
-        self._export_btn.setObjectName("")
         self._export_btn.setStyleSheet("""
             QPushButton { background-color: #45475a; padding: 6px 12px; font-size: 12px; }
             QPushButton:hover { background-color: #585b70; }
@@ -80,7 +86,7 @@ class FilterableTable(QWidget):
         toolbar.addWidget(self._export_btn)
         layout.addLayout(toolbar)
 
-        # Table
+        # ── Table ─────────────────────────────────────────────────────────────
         self._table = QTableWidget()
         self._table.setColumnCount(len(self._columns))
         self._table.setHorizontalHeaderLabels([c[1] for c in self._columns])
@@ -92,20 +98,72 @@ class FilterableTable(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setShowGrid(False)
-        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._table.customContextMenuRequested.connect(self._show_context_menu)
 
         for i, (_, _, width) in enumerate(self._columns):
             self._table.setColumnWidth(i, width)
 
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        # ── Context menu support ──────────────────────────────────────────────
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_context_menu_requested)
+
         layout.addWidget(self._table)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_context_menu_handler(self, handler: Callable):
+        """
+        Register a callable that receives (row_data: dict, global_pos: QPoint).
+        Called whenever the user right-clicks on a table row.
+        """
+        self._context_menu_handler = handler
+
+    def set_multi_select(self, enabled: bool):
+        """Enable (ExtendedSelection) or disable (SingleSelection) multi-row selection."""
+        mode = (
+            QAbstractItemView.ExtendedSelection
+            if enabled
+            else QAbstractItemView.SingleSelection
+        )
+        self._table.setSelectionMode(mode)
+
+    def get_selected_rows(self) -> list[dict]:
+        """Return row data dicts for all currently selected rows (unique, ordered)."""
+        seen: set[int] = set()
+        result: list[dict] = []
+        for item in self._table.selectedItems():
+            r = item.row()
+            if r in seen:
+                continue
+            seen.add(r)
+            data = self._table.item(r, 0)
+            if data:
+                rd = data.data(Qt.UserRole)
+                if rd:
+                    result.append(rd)
+        return result
 
     def load_data(self, data: list[dict]):
         """Load new data and refresh table."""
         self._all_data = data
         self._filtered_data = data
         self._apply_filter(self._search_box.text())
+
+    def get_visible_data(self) -> list[dict]:
+        return list(self._filtered_data)
+
+    def clear(self):
+        self._all_data = []
+        self._filtered_data = []
+        self._table.setRowCount(0)
+        self._count_label.setText("0 items")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Private
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _apply_filter(self, text: str):
         if text.strip():
@@ -129,7 +187,7 @@ class FilterableTable(QWidget):
                 item = QTableWidgetItem(display)
                 item.setData(Qt.UserRole, row_data)
 
-                # Color-code compliance/status cells
+                # Colour-code compliance/status cells
                 color_key = display.lower().strip()
                 if color_key in COMPLIANCE_COLORS:
                     item.setForeground(QColor(COMPLIANCE_COLORS[color_key]))
@@ -137,7 +195,9 @@ class FilterableTable(QWidget):
                 self._table.setItem(row_i, col_i, item)
 
         self._table.setSortingEnabled(True)
-        self._count_label.setText(f"{len(self._filtered_data)} / {len(self._all_data)} items")
+        self._count_label.setText(
+            f"{len(self._filtered_data)} / {len(self._all_data)} items"
+        )
 
     def _on_selection_changed(self):
         rows = self._table.selectedItems()
@@ -147,53 +207,21 @@ class FilterableTable(QWidget):
             if row_data:
                 self.row_selected.emit(self._table.currentRow(), row_data)
 
-    def _show_context_menu(self, pos):
-        item = self._table.itemAt(pos)
-        if not item:
+    def _on_context_menu_requested(self, pos):
+        if self._context_menu_handler is None:
             return
+        item = self._table.itemAt(pos)
+        if item is None:
+            return
+        row_data = item.data(Qt.UserRole)
+        if row_data:
+            global_pos = self._table.viewport().mapToGlobal(pos)
+            self._context_menu_handler(row_data, global_pos)
 
-        row_data = item.data(Qt.UserRole) or {}
-        row = item.row()
-        col = item.column()
-        cell_text = item.text()
 
-        # Keep row selected when context menu is invoked from a non-selected row.
-        self._table.selectRow(row)
-        self._table.setCurrentCell(row, col)
-
-        menu = QMenu(self)
-
-        copy_cell = QAction("Copy Cell", self)
-        copy_cell.triggered.connect(lambda: self._copy_to_clipboard(cell_text))
-        menu.addAction(copy_cell)
-
-        copy_row_json = QAction("Copy Row JSON", self)
-        copy_row_json.triggered.connect(
-            lambda: self._copy_to_clipboard(json.dumps(row_data, ensure_ascii=False, indent=2, default=str))
-        )
-        menu.addAction(copy_row_json)
-
-        menu.addSeparator()
-
-        explain_action = QAction("Explain Selected Row", self)
-        explain_action.triggered.connect(lambda: self.row_action_requested.emit("explain", row_data))
-        menu.addAction(explain_action)
-
-        menu.exec(self._table.viewport().mapToGlobal(pos))
-
-    def _copy_to_clipboard(self, text: str):
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setText(text)
-
-    def get_visible_data(self) -> list[dict]:
-        return list(self._filtered_data)
-
-    def clear(self):
-        self._all_data = []
-        self._filtered_data = []
-        self._table.setRowCount(0)
-        self._count_label.setText("0 items")
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _format_value(value: Any) -> str:
     if value is None:
