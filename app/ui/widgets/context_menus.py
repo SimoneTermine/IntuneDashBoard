@@ -21,9 +21,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QPoint, QThread, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
-    QAction,
     QApplication,
     QDialog,
     QDialogButtonBox,
