@@ -18,16 +18,15 @@ from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from app.ui.pages import (
     OverviewPage, DeviceExplorerPage, DeviceDetailPage,
     PolicyExplorerPage, ExplainabilityPage, AppOpsPage,
-    GovernancePage, GroupUsagePage, SettingsPage, GraphQueryPage,
+    GovernancePage, GroupUsagePage, RemediationsPage,
+    SettingsPage, GraphQueryPage,
 )
 from app.ui.widgets.sync_status_widget import SyncStatusWidget
+from app.version import APP_NAME, __version__
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar button
-# ─────────────────────────────────────────────────────────────────────────────
 class SidebarButton(QPushButton):
     def __init__(self, icon: str, text: str, parent=None):
         super().__init__(f"  {icon}  {text}", parent)
@@ -46,83 +45,59 @@ class SidebarSectionLabel(QLabel):
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main Window
-# ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Intune Dashboard")
+        self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.setMinimumSize(1200, 720)
         self.resize(1440, 900)
         self._sync_worker = None
         self._setup_ui()
         self._setup_shortcuts()
-        self._check_first_run()
 
-        # Auto-refresh overview every 60 s
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.timeout.connect(self._auto_refresh)
-        self._refresh_timer.start(60_000)
-
-        # Start scheduler
-        from app.config import AppConfig
-        if AppConfig().sync_enabled and not AppConfig().demo_mode:
-            try:
-                from app.collector.sync_engine import start_scheduler
-                start_scheduler(sync_callback=self._on_scheduled_sync_done)
-            except Exception as e:
-                logger.warning(f"Scheduler start failed: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # UI construction
-    # ─────────────────────────────────────────────────────────────────────
     def _setup_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # ── Sidebar ──────────────────────────────────────────────────────
+        # Sidebar
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(230)
+        sidebar.setFixedWidth(220)
+        sidebar.setStyleSheet(
+            "QFrame#Sidebar { background: #181825; border-right: 1px solid #313244; }"
+        )
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(8, 16, 8, 8)
-        sidebar_layout.setSpacing(2)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
 
-        # Logo / app name
-        logo = QLabel("🛡️  Intune Dashboard")
-        logo.setStyleSheet("color: #cba6f7; font-size: 15px; font-weight: bold; padding: 8px 12px;")
+        logo = QLabel(f"  \U0001f6e1\ufe0f  {APP_NAME}")
+        logo.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #cba6f7; "
+            "padding: 18px 16px 14px 16px; border-bottom: 1px solid #313244;"
+        )
         sidebar_layout.addWidget(logo)
 
-        version_lbl = QLabel("v1.0.0  ·  read-only")
-        version_lbl.setStyleSheet("color: #45475a; font-size: 10px; padding: 0 12px 8px 12px;")
-        sidebar_layout.addWidget(version_lbl)
-
-        # Navigation entries: (icon, label, page_index, section_header)
         nav_entries = [
-            (None, "OVERVIEW", None, True),
-            ("📊", "Overview", "overview", False),
-
-            (None, "INVENTORY", None, True),
-            ("🖥️", "Device Explorer", "devices", False),
-            ("📋", "Device Detail", "device_detail", False),
-            ("📑", "Policy Explorer", "policies", False),
-            ("👥", "Group Usage", "group_usage", False),
-
-            (None, "ANALYSIS", None, True),
-            ("🔍", "Explain State", "explain", False),
-            ("📦", "App Ops", "app_ops", False),
-            ("🧪", "Graph Query Lab", "graph_query", False),
-
-            (None, "GOVERNANCE", None, True),
-            ("📈", "Drift & Snapshots", "governance", False),
-
-            (None, "SETTINGS", None, True),
-            ("⚙️", "Settings", "settings", False),
+            (None, "OVERVIEW",    None,              True),
+            ("📊", "Overview",    "overview",        False),
+            (None, "INVENTORY",   None,              True),
+            ("🖥️", "Device Explorer",  "devices",       False),
+            ("📋", "Device Detail",    "device_detail", False),
+            ("📑", "Policy Explorer",  "policies",      False),
+            ("👥", "Group Usage",      "group_usage",   False),
+            (None, "ANALYSIS",    None,              True),
+            ("🔍", "Explain State",    "explain",       False),
+            ("📦", "App Ops",          "app_ops",       False),
+            ("💊", "Remediations",     "remediations",  False),
+            ("🧪", "Graph Query Lab",  "graph_query",   False),
+            (None, "GOVERNANCE",  None,              True),
+            ("📈", "Drift & Snapshots", "governance",   False),
+            (None, "SETTINGS",    None,              True),
+            ("⚙️", "Settings",    "settings",        False),
         ]
 
         self._nav_buttons: dict[str, SidebarButton] = {}
@@ -141,24 +116,24 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch()
 
-        # Sync status widget at bottom of sidebar
         self._sync_widget = SyncStatusWidget()
         self._sync_widget.sync_requested.connect(self.run_sync)
         sidebar_layout.addWidget(self._sync_widget)
 
         root_layout.addWidget(sidebar)
 
-        # ── Content area ────────────────────────────────────────────────
+        # Content area
         content_area = QWidget()
         content_layout = QVBoxLayout(content_area)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
 
-        # Top toolbar (global search)
         toolbar = QFrame()
         toolbar.setObjectName("Toolbar")
         toolbar.setFixedHeight(50)
-        toolbar.setStyleSheet("QFrame#Toolbar { background: #181825; border-bottom: 1px solid #313244; }")
+        toolbar.setStyleSheet(
+            "QFrame#Toolbar { background: #181825; border-bottom: 1px solid #313244; }"
+        )
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(12, 0, 12, 0)
 
@@ -187,23 +162,21 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(demo_badge)
         content_layout.addWidget(toolbar)
 
-        # Stacked pages
         self._stack = QStackedWidget()
         self._pages: dict[str, QWidget] = {}
 
-        # Instantiate all pages
-        self._pages["overview"] = OverviewPage()
-        self._pages["devices"] = DeviceExplorerPage()
+        self._pages["overview"]      = OverviewPage()
+        self._pages["devices"]       = DeviceExplorerPage()
         self._pages["device_detail"] = DeviceDetailPage()
-        self._pages["policies"] = PolicyExplorerPage()
-        self._pages["group_usage"] = GroupUsagePage()
-        self._pages["explain"] = ExplainabilityPage()
-        self._pages["app_ops"] = AppOpsPage()
-        self._pages["graph_query"] = GraphQueryPage()
-        self._pages["governance"] = GovernancePage()
-        self._pages["settings"] = SettingsPage()
+        self._pages["policies"]      = PolicyExplorerPage()
+        self._pages["group_usage"]   = GroupUsagePage()
+        self._pages["explain"]       = ExplainabilityPage()
+        self._pages["app_ops"]       = AppOpsPage()
+        self._pages["remediations"]  = RemediationsPage()
+        self._pages["graph_query"]   = GraphQueryPage()
+        self._pages["governance"]    = GovernancePage()
+        self._pages["settings"]      = SettingsPage()
 
-        # Wire inter-page navigation
         self._pages["devices"].device_selected.connect(self._on_device_selected)
 
         for page in self._pages.values():
@@ -212,57 +185,39 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._stack)
         root_layout.addWidget(content_area)
 
-        # Status bar
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Ready")
 
-        # Navigate to overview by default
         self._navigate("overview")
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search)
         QShortcut(QKeySequence("F5"), self, self._refresh_current)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Navigation
-    # ─────────────────────────────────────────────────────────────────────
     def _navigate(self, page_key: str):
         if page_key not in self._pages:
             logger.warning(f"Unknown page: {page_key}")
             return
-
-        # Update sidebar button states
         for k, btn in self._nav_buttons.items():
             btn.setChecked(k == page_key)
-
         page = self._pages[page_key]
         self._stack.setCurrentWidget(page)
-
-        # Trigger page-specific refresh
         if hasattr(page, "refresh"):
             try:
                 page.refresh()
             except Exception as e:
                 logger.warning(f"Page refresh failed ({page_key}): {e}")
-
         self._status_bar.showMessage(f"Viewing: {page_key.replace('_', ' ').title()}")
 
     def navigate_to_explain(self, device_id: str):
-        """Navigate to explainability page pre-loaded for a device."""
         self._navigate("explain")
-        explain_page: ExplainabilityPage = self._pages["explain"]
-        explain_page.load_device(device_id)
+        self._pages["explain"].load_device(device_id)
 
     def _on_device_selected(self, device_id: str):
-        """User clicked a device in explorer → go to detail page."""
         self._navigate("device_detail")
-        detail_page: DeviceDetailPage = self._pages["device_detail"]
-        detail_page.load_device(device_id)
+        self._pages["device_detail"].load_device(device_id)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Global search
-    # ─────────────────────────────────────────────────────────────────────
     def _focus_search(self):
         self._global_search.setFocus()
         self._global_search.selectAll()
@@ -271,176 +226,43 @@ class MainWindow(QMainWindow):
         query = self._global_search.text().strip()
         if not query:
             return
+        self._navigate("devices")
+        if hasattr(self._pages["devices"], "set_search"):
+            self._pages["devices"].set_search(query)
 
-        from app.analytics.queries import global_search
-        results = global_search(query)
-
-        devices = results.get("devices", [])
-        controls = results.get("controls", [])
-        apps = results.get("apps", [])
-
-        if devices:
-            # Navigate to device explorer and pre-filter
-            explorer: DeviceExplorerPage = self._pages["devices"]
-            explorer._table._search_box.setText(query)
-            self._navigate("devices")
-            self._status_bar.showMessage(
-                f"Search '{query}': {len(devices)} devices, {len(controls)} policies, {len(apps)} apps"
-            )
-        elif controls:
-            policy_page: PolicyExplorerPage = self._pages["policies"]
-            policy_page._policy_table._search_box.setText(query)
-            self._navigate("policies")
-        else:
-            self._status_bar.showMessage(f"No results for '{query}'")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Sync
-    # ─────────────────────────────────────────────────────────────────────
-    def run_sync(self):
-        """Start a manual full sync in background."""
-        if self._sync_worker and self._sync_worker.isRunning():
-            QMessageBox.information(self, "Sync", "A sync is already running.")
-            return
-
-        from app.config import AppConfig
-        cfg = AppConfig()
-
-        if not cfg.demo_mode and (not cfg.tenant_id or not cfg.client_id):
-            QMessageBox.warning(
-                self, "Not Configured",
-                "Please configure Tenant ID and Client ID in Settings before syncing.\n"
-                "Or enable Demo Mode to explore the UI without credentials."
-            )
-            return
-
-        from app.ui.workers.sync_worker import SyncWorker, AuthWorker
-
-        # If using device code and not cached, authenticate first
-        if not cfg.demo_mode and cfg.auth_mode == "device_code":
-            from app.graph.auth import get_auth
-            if not get_auth().has_cached_token():
-                self._do_auth_then_sync()
-                return
-
-        self._start_sync_worker()
-
-    def _do_auth_then_sync(self):
-        """Authenticate via device code then start sync."""
-        from app.ui.workers.sync_worker import AuthWorker
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
-
-        self._auth_dlg = None
-        worker = AuthWorker()
-
-        def on_code(user_code, uri):
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Sign in to Microsoft")
-            dlg.setMinimumWidth(440)
-            dl = QVBoxLayout(dlg)
-            dl.addWidget(QLabel("<b>Step 1:</b> Open this URL in your browser:"))
-            url_lbl = QLabel(f'<a href="{uri}" style="color:#89dceb">{uri}</a>')
-            url_lbl.setOpenExternalLinks(True)
-            dl.addWidget(url_lbl)
-            dl.addWidget(QLabel("<b>Step 2:</b> Enter this code:"))
-            code_lbl = QLabel(f'<center><span style="font-size:32px;font-weight:bold;color:#cba6f7">{user_code}</span></center>')
-            code_lbl.setTextFormat(Qt.RichText)
-            dl.addWidget(code_lbl)
-            dl.addWidget(QLabel("Waiting for sign-in…"))
-            cancel_btn = QPushButton("Cancel")
-            cancel_btn.clicked.connect(dlg.reject)
-            dl.addWidget(cancel_btn)
-            self._auth_dlg = dlg
-            dlg.show()
-
-        def on_done(success, message):
-            if self._auth_dlg:
-                self._auth_dlg.accept()
-            if success:
-                self._start_sync_worker()
-            else:
-                QMessageBox.warning(self, "Auth Failed", message)
-
-        worker.device_code_ready.connect(on_code)
-        worker.finished.connect(on_done)
-        self._auth_worker = worker
-        worker.start()
-
-    def _start_sync_worker(self):
-        from app.ui.workers.sync_worker import SyncWorker
-        self._sync_worker = SyncWorker()
-        self._sync_worker.progress.connect(self._on_sync_progress)
-        self._sync_worker.finished.connect(self._on_sync_finished)
-        self._sync_worker.start()
-        self._sync_widget.set_syncing(True)
-        self._status_bar.showMessage("Sync in progress…")
-
-    def _on_sync_progress(self, stage, percent, message, is_error):
-        self._sync_widget.update_progress(stage, percent, message, is_error)
-        self._status_bar.showMessage(f"Sync: {message}")
-
-    def _on_sync_finished(self, success, message):
-        self._sync_widget.set_syncing(False)
-        self._status_bar.showMessage(message)
-        # Refresh the current page
-        self._refresh_current()
-
-    def _on_scheduled_sync_done(self):
-        self._sync_widget.set_syncing(False)
-        self._refresh_current()
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Refresh
-    # ─────────────────────────────────────────────────────────────────────
     def _refresh_current(self):
         current = self._stack.currentWidget()
-        if hasattr(current, "refresh"):
+        if current and hasattr(current, "refresh"):
             try:
                 current.refresh()
             except Exception as e:
-                logger.warning(f"Refresh failed: {e}")
+                logger.warning(f"Manual refresh failed: {e}")
 
-    def _auto_refresh(self):
-        """Silently refresh the overview KPIs."""
-        try:
-            self._pages["overview"].refresh()
-        except Exception:
-            pass
-
-    # ─────────────────────────────────────────────────────────────────────
-    # First-run check
-    # ─────────────────────────────────────────────────────────────────────
-    def _check_first_run(self):
-        from app.config import AppConfig
-        from app.analytics.queries import get_overview_kpis
-        cfg = AppConfig()
-
-        kpis = get_overview_kpis()
-        if kpis["total_devices"] == 0:
-            if cfg.demo_mode:
-                # Auto-load demo data
-                QTimer.singleShot(500, self._load_demo)
-            else:
-                self._status_bar.showMessage(
-                    "No data yet. Configure your tenant in Settings and click 'Sync Now'."
-                )
-
-    def _load_demo(self):
-        from app.demo.demo_data import load_demo_data
-        try:
-            count = load_demo_data()
-            self._status_bar.showMessage(f"Demo data loaded: {count} objects")
-            self._pages["overview"].refresh()
-        except Exception as e:
-            logger.error(f"Demo data load failed: {e}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Close
-    # ─────────────────────────────────────────────────────────────────────
-    def closeEvent(self, event):
-        from app.collector.sync_engine import stop_scheduler
-        stop_scheduler()
+    def run_sync(self):
+        from app.ui.workers.sync_worker import SyncWorker
         if self._sync_worker and self._sync_worker.isRunning():
-            self._sync_worker.quit()
-            self._sync_worker.wait(3000)
-        event.accept()
+            QMessageBox.information(self, "Sync", "A sync is already in progress.")
+            return
+        self._sync_widget.set_syncing(True)
+        self._status_bar.showMessage("Syncing…")
+        self._sync_worker = SyncWorker()
+        self._sync_worker.finished.connect(self._on_sync_finished)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.start()
+
+    def _on_sync_progress(self, msg: str):
+        self._status_bar.showMessage(f"Sync: {msg}")
+
+    def _on_sync_finished(self, success: bool, message: str):
+        self._sync_widget.set_syncing(False)
+        if success:
+            self._status_bar.showMessage(f"Sync complete — {message}")
+            current = self._stack.currentWidget()
+            if current and hasattr(current, "refresh"):
+                try:
+                    current.refresh()
+                except Exception:
+                    pass
+        else:
+            self._status_bar.showMessage(f"Sync failed: {message}")
+            QMessageBox.warning(self, "Sync Failed", message)

@@ -146,6 +146,24 @@ class GraphClient:
         self._ensure_token()
         return self._request("GET", url, params=params)
 
+    def post(
+        self,
+        endpoint: str,
+        json: Dict | None = None,
+        api_version: str = "v1.0",
+        expected_status: int = 200,
+    ) -> Dict:
+        """
+        POST to a Graph endpoint.
+
+        expected_status is informational (the _request method already handles 204 → {}).
+        Returns the parsed JSON body, or {} for 204 No Content responses.
+        """
+        base = GRAPH_BASE_URL_V1 if api_version == "v1.0" else GRAPH_BASE_URL_BETA
+        url = endpoint if endpoint.startswith("http") else f"{base}/{endpoint}"
+        self._ensure_token()
+        return self._request("POST", url, json_body=json)
+
     def get_paged(
         self,
         endpoint: str,

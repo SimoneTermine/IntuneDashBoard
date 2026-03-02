@@ -6,5 +6,6 @@ from app.ui.pages.explainability_page import ExplainabilityPage
 from app.ui.pages.app_ops_page import AppOpsPage
 from app.ui.pages.governance_page import GovernancePage
 from app.ui.pages.group_usage_page import GroupUsagePage
+from app.ui.pages.remediations_page import RemediationsPage
 from app.ui.pages.settings_page import SettingsPage
 from app.ui.pages.graph_query_page import GraphQueryPage

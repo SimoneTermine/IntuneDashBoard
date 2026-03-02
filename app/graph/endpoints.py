@@ -1,4 +1,6 @@
 """
+app/graph/endpoints.py
+
 Graph API endpoint definitions.
 All $select field lists have been verified against the microsoft.graph schema.
 
@@ -31,17 +33,17 @@ SETTINGS_CATALOG_POLICIES    = "deviceManagement/configurationPolicies"
 SETTINGS_CATALOG_ASSIGNMENTS = "deviceManagement/configurationPolicies/{policy_id}/assignments"
 
 # ── Apps ───────────────────────────────────────────────────────────────────
-MOBILE_APPS = "deviceAppManagement/mobileApps"
-APP_ASSIGNMENTS = "deviceAppManagement/mobileApps/{app_id}/assignments"
+MOBILE_APPS      = "deviceAppManagement/mobileApps"
+APP_ASSIGNMENTS  = "deviceAppManagement/mobileApps/{app_id}/assignments"
 
 # Per-device install status — endpoint differs by app type:
-#   /deviceStatuses   → iOS LOB, Android LOB, Managed Store apps (beta)
+#   /deviceStatuses      → iOS LOB, Android LOB, Managed Store apps, winGetApp (beta)
 #   /deviceInstallStates → Win32LobApp, windowsMobileMSI (beta)
 APP_DEVICE_STATUSES      = "deviceAppManagement/mobileApps/{app_id}/deviceStatuses"
 APP_WIN32_INSTALL_STATES = "deviceAppManagement/mobileApps/{app_id}/deviceInstallStates"
 
 # ── Groups ─────────────────────────────────────────────────────────────────
-GROUPS = "groups"
+GROUPS       = "groups"
 GROUP_MEMBERS = "groups/{group_id}/members"
 # NOTE: devices/{id}/transitiveMemberOf requires Device.Read.All — NOT in default scope.
 # Only use users/{id}/transitiveMemberOf (requires User.Read.All — already in scope).
@@ -49,9 +51,23 @@ USER_TRANSITIVE_MEMBEROF = "users/{user_id}/transitiveMemberOf"
 
 # ── Organization ───────────────────────────────────────────────────────────
 ORGANIZATION = "organization"
-USER_DEVICES = "users/{user_id}/managedDevices"
+USER_DEVICES  = "users/{user_id}/managedDevices"
 
-# ── $select field lists ─────────────────────────────────────────────────────
+# ── Proactive Remediations (Device Health Scripts) ─────────────────────────
+# Requires DeviceManagementConfiguration.Read.All (list/read)
+# Requires DeviceManagementConfiguration.ReadWrite.All (run on-demand)
+DEVICE_HEALTH_SCRIPTS            = "deviceManagement/deviceHealthScripts"
+DEVICE_HEALTH_SCRIPT_BY_ID       = "deviceManagement/deviceHealthScripts/{script_id}"
+DEVICE_HEALTH_SCRIPT_ASSIGNMENTS = "deviceManagement/deviceHealthScripts/{script_id}/assignments"
+DEVICE_HEALTH_SCRIPT_RUN_SUMMARY = "deviceManagement/deviceHealthScripts/{script_id}/deviceRunStates"
+# On-demand run:  POST  deviceManagement/managedDevices/{device_id}/initiateOnDemandProactiveRemediation
+DEVICE_REMEDIATION_RUN = (
+    "deviceManagement/managedDevices/{device_id}/initiateOnDemandProactiveRemediation"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# $select field lists
+# ─────────────────────────────────────────────────────────────────────────────
 
 # managedDevice — verified valid fields
 DEVICE_SELECT_FIELDS = ",".join([
@@ -94,4 +110,11 @@ GROUP_SELECT_FIELDS = ",".join([
 COMPLIANCE_STATUS_SELECT = ",".join([
     "id", "deviceDisplayName", "status",
     "lastReportedDateTime", "userName", "userPrincipalName",
+])
+
+# deviceHealthScript (Proactive Remediation)
+REMEDIATION_SELECT_FIELDS = ",".join([
+    "id", "displayName", "description", "publisher",
+    "createdDateTime", "lastModifiedDateTime",
+    "isGlobalScript", "highestAvailableVersion",
 ])

@@ -137,64 +137,21 @@ class DeviceGroupMembership(Base):
     """Cached mapping of device → entra group memberships."""
     __tablename__ = "device_group_memberships"
 
-    device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True)
-    group_id = Column(String, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
-    synced_at = Column(DateTime, default=func.now())
-
-
-# ---------------------------------------------------------------------------
-# Outcome (Control × Device)
-# ---------------------------------------------------------------------------
-class Outcome(Base):
-    """
-    Observed or inferred state of a Control applied to a Device.
-    reason_code is an internal reason enum.
-    """
-    __tablename__ = "outcomes"
-
     id = Column(Integer, primary_key=True, autoincrement=True)
-    control_id = Column(String, ForeignKey("controls.id", ondelete="CASCADE"), index=True)
     device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
-    status = Column(String)  # success/error/conflict/notApplicable/unknown/compliant/nonCompliant
-    reason_code = Column(String)  # TARGETING_MISS / REQUIREMENT_NOT_MET / CONFLICT_SETTING / etc.
-    reason_detail = Column(Text)
-    error_code = Column(String)
-    source = Column(String)  # graph_direct / heuristic / inferred
-    raw_json = Column(Text)
+    group_id = Column(String, ForeignKey("groups.id", ondelete="CASCADE"), index=True)
     synced_at = Column(DateTime, default=func.now())
-
-    control = relationship("Control", back_populates="outcomes")
 
     __table_args__ = (
-        Index("ix_outcome_device_control", "device_id", "control_id"),
+        Index("ix_dev_grp", "device_id", "group_id"),
     )
 
 
 # ---------------------------------------------------------------------------
-# DeviceComplianceStatus (detailed per-policy compliance)
-# ---------------------------------------------------------------------------
-class DeviceComplianceStatus(Base):
-    __tablename__ = "device_compliance_status"
-
-    id = Column(String, primary_key=True)
-    device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
-    policy_id = Column(String, index=True)
-    policy_display_name = Column(String)
-    status = Column(String)
-    last_report_datetime = Column(DateTime)
-    user_name = Column(String)
-    user_principal_name = Column(String)
-    raw_json = Column(Text)
-    synced_at = Column(DateTime, default=func.now())
-
-    device = relationship("Device", back_populates="compliance_statuses")
-
-
-# ---------------------------------------------------------------------------
-# App + DeviceAppStatus
+# App
 # ---------------------------------------------------------------------------
 class App(Base):
-    """Intune managed app."""
+    """Managed mobile app from Intune."""
     __tablename__ = "apps"
 
     id = Column(String, primary_key=True)
@@ -238,6 +195,32 @@ class DeviceAppStatus(Base):
 
 
 # ---------------------------------------------------------------------------
+# Remediation (Proactive Remediation / Device Health Script)
+# ---------------------------------------------------------------------------
+class Remediation(Base):
+    """
+    Intune Proactive Remediation (deviceHealthScript).
+    Requires: DeviceManagementConfiguration.Read.All (list/read)
+              DeviceManagementConfiguration.ReadWrite.All (run on-demand)
+    """
+    __tablename__ = "remediations"
+
+    id = Column(String, primary_key=True)           # Graph deviceHealthScript id
+    display_name = Column(String, index=True)
+    description = Column(Text)
+    publisher = Column(String)
+    is_global_script = Column(Boolean, default=False)  # Microsoft-managed script
+    highest_available_version = Column(String)
+    last_modified_datetime = Column(DateTime, index=True)
+    created_datetime = Column(DateTime)
+    raw_json = Column(Text)
+    synced_at = Column(DateTime, default=func.now())
+
+    def __repr__(self):
+        return f"<Remediation {self.display_name}>"
+
+
+# ---------------------------------------------------------------------------
 # Snapshot (for drift detection)
 # ---------------------------------------------------------------------------
 class Snapshot(Base):
@@ -261,21 +244,71 @@ class SnapshotItem(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     snapshot_id = Column(Integer, ForeignKey("snapshots.id", ondelete="CASCADE"), index=True)
-    entity_type = Column(String)  # device / control / assignment
-    entity_id = Column(String)
+    entity_type = Column(String)   # device / control / assignment
+    entity_id = Column(String, index=True)
     display_name = Column(String)
-    checksum = Column(String)  # SHA256 of key fields
-    last_modified = Column(DateTime)
-    raw_snapshot_json = Column(Text)
+    raw_json = Column(Text)
 
     snapshot = relationship("Snapshot", back_populates="items")
 
 
 # ---------------------------------------------------------------------------
+# DeviceComplianceStatus
+# ---------------------------------------------------------------------------
+class DeviceComplianceStatus(Base):
+    """Per-device per-policy compliance evaluation state."""
+    __tablename__ = "device_compliance_statuses"
+
+    id = Column(String, primary_key=True)
+    device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
+    policy_id = Column(String, index=True)
+    policy_display_name = Column(String)
+    status = Column(String)  # compliant / noncompliant / error / conflict / ...
+    last_report_datetime = Column(DateTime)
+    user_name = Column(String)
+    user_principal_name = Column(String)
+    raw_json = Column(Text)
+    synced_at = Column(DateTime, default=func.now())
+
+    device = relationship("Device", back_populates="compliance_statuses")
+
+
+# ---------------------------------------------------------------------------
+# Outcome (Explainability engine)
+# ---------------------------------------------------------------------------
+class Outcome(Base):
+    """
+    Observed or inferred state of a Control applied to a Device.
+    reason_code is an internal reason enum.
+    """
+    __tablename__ = "outcomes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    control_id = Column(String, ForeignKey("controls.id", ondelete="CASCADE"), index=True)
+    device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
+    status = Column(String)  # success/error/conflict/notApplicable/unknown/compliant/nonCompliant
+    reason_code = Column(String)  # TARGETING_MISS / REQUIREMENT_NOT_MET / CONFLICT_SETTING / etc.
+    reason_detail = Column(Text)
+    error_code = Column(String)
+    source = Column(String)  # graph_direct / heuristic / inferred
+    raw_json = Column(Text)
+    synced_at = Column(DateTime, default=func.now())
+
+    control = relationship("Control", back_populates="outcomes")
+
+    __table_args__ = (
+        Index("ix_outcome_device_control", "device_id", "control_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SyncLog
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # DriftReport
 # ---------------------------------------------------------------------------
 class DriftReport(Base):
-    """Report of changes between two snapshots or a sync cycle."""
+    """Report of changes detected between two snapshots."""
     __tablename__ = "drift_reports"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -287,18 +320,21 @@ class DriftReport(Base):
     modified_count = Column(Integer, default=0)
     report_json = Column(Text)  # full diff as JSON
 
+    def __repr__(self):
+        return f"<DriftReport baseline={self.baseline_snapshot_id} current={self.current_snapshot_id}>"
+
 
 # ---------------------------------------------------------------------------
 # SyncLog
 # ---------------------------------------------------------------------------
 class SyncLog(Base):
-    """Log of each sync run."""
+    """Record of a sync run."""
     __tablename__ = "sync_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     started_at = Column(DateTime, default=func.now())
     finished_at = Column(DateTime)
-    status = Column(String)  # running / success / partial / failed
+    status = Column(String)          # success / failed / partial
     devices_synced = Column(Integer, default=0)
     controls_synced = Column(Integer, default=0)
     apps_synced = Column(Integer, default=0)

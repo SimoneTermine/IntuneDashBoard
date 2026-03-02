@@ -1,250 +1,197 @@
 # Intune Dashboard
 
-Desktop app locale per amministratori Microsoft Intune. Connessione via Microsoft Graph API, storage SQLite locale.
+A local desktop application for Microsoft Intune administrators.
+Connects to Microsoft Graph API, caches data in a local SQLite database,
+and provides a rich UI for device management, policy exploration, and governance.
 
 ---
 
-## 📋 Panoramica funzionalità
+## Features
 
-- **Device Explorer** — ricerca, filtro, ordinamento di tutti i device gestiti
-- **Policy Explorer** — compliance policies, config policies, settings catalog, app explorer
-- **Device Detail** — scheda completa con tab Compliance, Apps, Groups
-- **Explainability** — motore inferenziale che spiega perché una policy si applica (o no) a un device
-- **App Ops** — stato deployment app, top failures, clustering errori
-- **Governance** — snapshot point-in-time, drift detection tra snapshot
-- **Right-click context menus** — su device, policy, snapshot, drift row
-- **Export PDF** — evidence pack audit per singolo device
-
----
-
-## 🔑 Permessi Microsoft Graph richiesti
-
-| Permesso | Tipo | Obbligatorio | Note |
-|---|---|---|---|
-| `DeviceManagementManagedDevices.Read.All` | Delegated | ✅ | Device metadata, compliance state |
-| `DeviceManagementConfiguration.Read.All` | Delegated | ✅ | Config policies, settings catalog |
-| `DeviceManagementApps.Read.All` | Delegated | ✅ | App metadata, install status |
-| `DeviceManagementServiceConfig.Read.All` | Delegated | ✅ | Service config |
-| `Group.Read.All` | Delegated | ✅ | Group targeting |
-| `User.Read.All` | Delegated | ✅ | User memberships |
-| `Directory.Read.All` | Delegated | ✅ | Entra directory objects |
-| `Device.Read.All` | Delegated | ⚠️ Opzionale | Device group memberships (transitiveMemberOf). Senza questo, la tab Groups in Device Detail è vuota. |
-
-### Configurazione App Registration in Entra
-
-1. **Entra Admin Center → App registrations → New registration**
-2. Nome: `IntuneDashboard` — Supported account types: `Single tenant`
-3. **API permissions** → Add all permissions above → Grant admin consent
-4. **Authentication → Add a platform → Mobile and desktop applications**
-   Abilitare: `https://login.microsoftonline.com/common/oauth2/nativeclient`
-5. **Advanced settings → Allow public client flows = YES**
+| Page | Description |
+|---|---|
+| **Overview** | KPI cards, compliance charts, recent sync log |
+| **Device Explorer** | Search, filter, sort devices; right-click context menu |
+| **Policy Explorer** | Compliance, config, Settings Catalog, Endpoint Security, apps |
+| **Remediations** | Proactive Remediation scripts — list, inspect, run on-demand |
+| **App Ops** | Deployment state, top failures, install error clustering |
+| **Governance** | Point-in-time snapshots, drift detection between snapshots |
+| **Explainability** | Full reasoning chain: why a policy applies to a device |
+| **Group Usage** | Objects assigned to a group, dead-assignment detection |
+| **Graph Query Lab** | Ad-hoc Graph API tool with paged collection support |
+| **Settings** | Tenant / auth config, scheduler, storage paths |
 
 ---
 
-## 🚀 Setup e avvio (sviluppo)
+## Requirements
+
+- Python **3.10+**
+- PySide6, msal, sqlalchemy, requests, apscheduler
 
 ```bash
-# 1. Clona o scarica
+pip install -r requirements.txt
+```
+
+---
+
+## Entra App Registration
+
+1. **Entra Admin Center → App registrations → New registration** (Single tenant)
+2. **API permissions → Microsoft Graph → Delegated** — add all of the following:
+
+| Permission | Required for |
+|---|---|
+| `DeviceManagementManagedDevices.Read.All` | Devices, compliance, force sync |
+| `DeviceManagementConfiguration.Read.All` | Policies, remediations (list/read) |
+| `DeviceManagementConfiguration.ReadWrite.All` | **Run Remediation on-demand** (write) |
+| `DeviceManagementApps.Read.All` | Apps, install status |
+| `Group.Read.All` | Group targeting, dead-assignment detection |
+| `User.Read.All` | User memberships, device–user correlation |
+| `Device.Read.All` | Device group memberships |
+| `DeviceManagementRBAC.Read.All` | RBAC scope tags |
+
+3. **Grant admin consent** for your tenant.
+4. **Authentication → Add a platform → Mobile and desktop applications**
+   Enable redirect URI: `https://login.microsoftonline.com/common/oauth2/nativeclient`
+5. **Advanced settings → Allow public client flows → Yes**
+
+> **Note on `ReadWrite.All` vs `Read.All`**: Adding `ReadWrite.All` implicitly covers
+> `Read.All` — you do not need to add both. The write permission is only exercised
+> when you explicitly click "Run on Device" in the Remediations page.
+
+---
+
+## Quick Start
+
+```bash
 git clone https://github.com/yourorg/intune-dashboard.git
 cd intune-dashboard
 
-# 2. Ambiente virtuale
 python -m venv .venv
-.venv\Scripts\activate       # Windows
-# source .venv/bin/activate  # Linux/macOS
+.venv\Scripts\activate        # Windows
+# or: source .venv/bin/activate  # macOS / Linux
 
-# 3. Dipendenze
 pip install -r requirements.txt
-
-# 4. Avvio
 python main.py
 ```
 
-### Prima configurazione
+### First-time setup
 
-1. Aprire **Settings → Tenant / Auth**
-2. Inserire **Tenant ID** e **Client ID**
-3. Auth Mode: `device_code` (consigliato)
-4. Cliccare **Save Settings**
-5. Cliccare **Test Graph Connection** → apparirà URL + codice
-6. Aprire l'URL nel browser, inserire il codice, accedere con account admin
-7. Tornare nell'app → connessione confermata
-8. Cliccare **Sync Now** nella sidebar
+1. Settings → enter **Tenant ID** and **Client ID** (click 👁 to reveal masked fields)
+2. **Auth Mode**: `device_code` (recommended for interactive admin use)
+3. Click **Save Settings**
+4. Click **Test Graph Connection**
+5. A dialog appears with a URL and a code — open the URL in a browser,
+   enter the code, and sign in with an admin account
+6. The dialog closes automatically once authentication succeeds
+7. Click **Sync Now** in the sidebar
 
-### Demo Mode (nessuna credenziale richiesta)
+### Automatic scope re-authentication
 
-1. Settings → spuntare **Enable Demo Mode**
-2. **Save Settings** → **Sync Now**
-3. L'app carica dati sintetici per esplorare tutte le funzionalità
+When new Graph API permissions are added to the app (e.g. after an update),
+the token cache is **automatically cleared on next startup** and you will be
+prompted to sign in again with the updated permission set.
+No manual action required beyond completing the sign-in flow.
 
----
+### Demo Mode
 
-## 📁 Struttura del repository
-
-```
-intune-dashboard/
-├── main.py                              # Entry point
-├── requirements.txt
-├── intune_dashboard.spec                # Build PyInstaller
-├── setup_app_registration.ps1          # PowerShell helper
-│
-├── app/
-│   ├── config.py                        # Config singleton (JSON locale)
-│   ├── logging_config.py                # Rotating file loggers (main + subsystem)
-│   ├── db/
-│   │   ├── models.py                    # 12+ modelli ORM SQLAlchemy
-│   │   └── database.py                  # Engine SQLite + WAL, session factory
-│   ├── graph/
-│   │   ├── auth.py                      # MSAL Device Code + App-Only
-│   │   ├── client.py                    # HTTP client con retry, 429, paginazione
-│   │   └── endpoints.py                 # Costanti endpoint e $select fields verificati
-│   ├── collector/
-│   │   ├── sync_engine.py               # Orchestratore + APScheduler + cooldown
-│   │   ├── devices.py                   # Sync device metadata
-│   │   ├── policies.py                  # Compliance + Config + Settings Catalog
-│   │   ├── apps.py                      # App metadata + install status (winGet, LOB, Win32)
-│   │   ├── groups.py                    # Group metadata
-│   │   ├── memberships.py               # Device/user → group memberships
-│   │   └── compliance_status.py         # Per-device per-policy compliance state
-│   ├── analytics/
-│   │   ├── queries.py                   # Query layer (tutti i get_* functions)
-│   │   └── explainability.py            # Motore inferenziale policy → device
-│   ├── ui/
-│   │   ├── main_window.py               # Finestra principale + sidebar
-│   │   ├── pages/                       # Una page per sezione
-│   │   └── widgets/
-│   │       ├── filterable_table.py      # Tabella con filtro + context menu support
-│   │       └── context_menus.py         # Right-click menu builders + dialogs
-│   ├── demo/
-│   │   └── demo_data.py                 # Dati sintetici per demo mode
-│   └── export/
-│       └── pdf_generator.py             # Evidence pack PDF
-```
+Enable in Settings to load synthetic data without credentials.
 
 ---
 
-## ⏱️ Sync
+## Portal Deep-links
 
-Sync manuale: pulsante **↻ Sync Now** nella sidebar.
-**Cooldown**: 90 secondi tra sync manuali (countdown visibile nel pulsante).
+All "Open in Intune Portal" context menu actions use the correct portal blade per policy type.
+URL construction is centralised in `app/utils/intune_links.py`.
 
-Pipeline sync completa (in ordine):
-1. `devices` — device metadata + overall compliance state
-2. `compliance_policies` — definizioni policy compliance
-3. `config_policies` — config classiche + settings catalog
-4. `apps` — metadata app + install status (winGet, LOB, Win32)
-5. `assignments` — control → group assignments
-6. `groups` — metadata gruppi referenziati
-7. `memberships` — device/user → group (abilita explainability e "Show Assigned Devices")
-8. `compliance_status` — per-device per-policy compliance state (abilita "Show Assigned Devices" per compliance)
-
----
-
-## 🔐 Sicurezza
-
-### Token cache
-- Percorso: `%APPDATA%\IntuneDashboard\msal_cache.bin`
-- Formato: MSAL serialized token cache (JSON)
-- Consiglio: `icacls msal_cache.bin /inheritance:r /grant:r "%USERNAME%:(R,W)"`
-
-### Cosa l'app NON fa mai
-- Non trasmette dati a server diversi da Microsoft Graph
-- Non raccoglie telemetria o dati d'uso
-- Non modifica dati Intune (read-only in questa versione)
-
----
-
-## 🛠️ Troubleshooting
-
-### Errori di autenticazione
-
-| Errore | Soluzione |
+| Policy type | Blade |
 |---|---|
-| `401 Unauthorized` | Token scaduto → cliccare "Test Graph Connection" |
-| `403 Forbidden` | Permessi mancanti → verificare API permissions e admin consent |
-| `AADSTS700016` | Client ID non trovato → verificare in Settings |
-| `AADSTS90002` | Tenant non trovato → verificare Tenant ID in Settings |
-| `AADSTS65005` | Device code non abilitato → Allow public client flows = YES |
+| Compliance policy | `CompliancePolicyOverview.ReactView` |
+| Settings Catalog / Endpoint Security | `PolicySummaryBlade` |
+| Windows / macOS Update config | `SoftwareUpdatesConfigurationSummaryReportBlade` |
+| Classic config profile | `DeviceConfigurationMenuBlade` |
+| App | `SettingsMenu/~/0` |
+| Remediation script | `DeviceHealthScriptsMenuBlade/~/scriptdetails` |
+| Device | `DeviceSettingsMenuBlade/~/overview` |
 
-### Errori di sync noti e comportamento atteso
+---
 
-| Messaggio | Significato | Azione |
-|---|---|---|
-| `App {id} (winGetApp): /deviceStatuses not available` | L'app non ha device con install state tracciato in Intune | Nessuna — è DEBUG, non impatta il funzionamento |
-| `App {id} (win32LobApp): /deviceInstallStates failed` | Nessun device ha mai riportato install state per questa app Win32 | Nessuna — DEBUG, best-effort |
-| `User membership lookup failed` | L'utente del device non ha userId/UPN popolato, o non ha gruppi | Nessuna — normale per device senza utente primario |
-| `403 devices/{id}/transitiveMemberOf` | Richiede `Device.Read.All` — non incluso nel set minimo | Aggiungere `Device.Read.All` all'app registration |
-| `No group memberships in local DB` | Sync memberships non ha trovato gruppi per il device | Normale se l'utente del device non è in nessun gruppo Entra |
+## Database Migration
 
-### "Show Assigned Devices" non mostra risultati
+The app automatically migrates existing databases on startup (`database.py/_migrate_db`):
 
-Dipende dal tipo di policy:
+- **`outcomes` table**: if the v1.0 schema is detected (missing `status` column),
+  the table is dropped and recreated. `outcomes` is fully derived data — it is rebuilt
+  from scratch on the next sync.
+- **Other tables**: additive `ALTER TABLE` migrations add missing columns
+  non-destructively (no data loss).
 
-- **Compliance policy** → mostra i risultati del collector `compliance_status`. Richiede che il sync step `compliance_status` sia stato eseguito almeno una volta dopo un sync completo.
-- **Config policy / Settings Catalog / Endpoint Security** → mostra i device che appartengono ai gruppi assegnati. Richiede che il sync step `memberships` sia stato eseguito. Senza `Device.Read.All`, i device group memberships potrebbero essere parziali (solo user-based).
+If you prefer to start fresh: delete `%APPDATA%\IntuneDashboard\intune_dashboard.db`
+and restart. A full sync will repopulate everything.
 
-### Tab "Apps" in Device Detail è vuota
+---
 
-Cause possibili:
-1. Il sync `apps` non ha trovato app di tipo supportato (`winGetApp`, `win32LobApp`, `iosLobApp`, etc.)
-2. Le app sono assegnate ma nessun device ha ancora riportato install state a Intune
-3. Il device selezionato non ha install records nel DB — eseguire un sync completo
+## Troubleshooting
 
-App supportate per install status:
-- `winGetApp` (WinGet — il più comune nei tenant moderni)
-- `win32LobApp` / `windowsMobileMSI` (via `/deviceInstallStates`)
-- `iosLobApp`, `androidLobApp`, `managedIOSStoreApp`, `managedAndroidStoreApp`
-- `microsoftStoreForBusinessApp`, `windowsUniversalAppX`, `windowsAppX`
-- `officeSuiteApp`, `webApp`
+**Remediations page is empty after sync**
 
-### Errori URL portale Intune ("missing parameter platformName")
+The Remediations sync requires `DeviceManagementConfiguration.Read.All`.
+Verify admin consent has been granted in Entra for this permission,
+then clear the token cache (Settings → Clear Token Cache) and re-authenticate.
 
-Il portale Intune ha aggiornato il formato delle URL di `PolicySummaryBlade`. L'app costruisce ora le URL con i parametri richiesti (`isAssigned~`, `technology`, `templateId`, `platformName`) letti dal raw_json salvato in locale. Se il DB è stato popolato con una versione precedente dell'app, fare un **reset DB + sync completo** per aggiornare il raw_json delle policy.
+**"Permission denied" when running a remediation**
 
-### Errori $select (corretti nelle ultime versioni)
+The "Run on Device" action requires `DeviceManagementConfiguration.ReadWrite.All`.
+Add this permission in Entra, re-grant admin consent. The app will detect the
+scope change automatically on next restart and prompt for re-authentication.
 
-I campi rimossi perché non validi nelle API Graph:
+**Device code dialog does not appear**
 
-| Campo | Endpoint | Rimosso da |
-|---|---|---|
-| `deviceType` | managedDevice | Derivato da `operatingSystem` |
-| `ownerType` | managedDevice | Usare `managedDeviceOwnerType` |
-| `@odata.type` | deviceConfiguration $select | Sempre presente nel body |
-| `appType` | mobileApp $select | Derivato da `@odata.type` nel body |
-| `isAssigned` | mobileApp $select e $filter | Non è una proprietà valida |
-| `managedDeviceId` | deviceComplianceDeviceStatus | Cambiato endpoint: usare `deviceCompliancePolicyStates` |
+Ensure `Auth Mode` is set to `device_code` in Settings. If the token cache is
+already valid, no dialog is needed. Use "Clear Token Cache" to force a new sign-in.
 
-### Problemi database
+**`no such column: outcomes.status` error**
+
+Your database was created with v1.0. Update `app/db/database.py` to v1.1.0 —
+the migration will drop and recreate `outcomes` automatically on next startup.
+
+**Log files** — all logs in `%APPDATA%\IntuneDashboard\logs\`
+
+| File | Contents |
+|---|---|
+| `intune_dashboard.log` | Root logger |
+| `graph.log` | HTTP client — rate limiting, 401/403, retries |
+| `collector.log` | Sync steps — per-item details |
+| `db.log` | Database layer |
+
+---
+
+## Unit Tests
 
 ```bash
-# Reset del database (⚠️ cancella tutti i dati in cache):
-del "%APPDATA%\IntuneDashboard\intune_dashboard.db"
-# Poi riavviare l'app e fare sync completo
+python tests/test_intune_links.py      # self-contained, no pytest required
+python -m pytest tests/ -v             # with pytest
 ```
-
-### Log files
-
-Percorso base: `%APPDATA%\IntuneDashboard\logs\`
-
-| File | Contenuto |
-|---|---|
-| `intune_dashboard.log` | Tutto (root logger) — punto di partenza per il debug |
-| `ui.log` | Componenti UI (`app.ui.*`) — errori context menu, dialog, page refresh |
-| `graph.log` | HTTP client Graph API — rate limiting, 401/403, retry |
-| `collector.log` | Collector sync — dettagli per ogni step di sync |
-| `db.log` | Database layer — query errors, session issues |
-
-Rotazione: 10 MB per file, 5 backup conservati.
 
 ---
 
-## 🏗️ Build EXE (PyInstaller)
+## Authentication — How It Works
 
-```bash
-pip install pyinstaller
-pyinstaller intune_dashboard.spec
-# Output: dist\IntuneDashboard\IntuneDashboard.exe
-```
+### Test Graph Connection
+Clicking **Test Graph Connection** in Settings always triggers a full re-authentication:
+1. The existing token cache is cleared.
+2. The device code dialog appears with a URL and a short code.
+3. Open the URL in any browser, enter the code, and sign in with your admin account.
+4. The dialog closes automatically and the connection result is shown.
 
-La cartella `dist\IntuneDashboard\` è autosufficiente — copiarla ovunque o zipparla.
-Dimensione attesa: ~150–300 MB (Qt/PySide6 incluso).
+### Automatic scope upgrade
+When `DEFAULT_SCOPES` changes between versions (e.g. `DeviceManagementConfiguration.ReadWrite.All`
+was added in v1.1.0 for Remediations), the app detects the mismatch on startup and clears
+the token cache. The next sync or Test Connection will prompt for a new sign-in that includes
+the updated permissions — no manual action required.
+
+---
+
+## Version History
+
+See [CHANGELOG.md](CHANGELOG.md).

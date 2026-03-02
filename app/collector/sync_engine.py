@@ -1,23 +1,23 @@
 """
+app/collector/sync_engine.py
+
 Sync Engine — orchestrates all collectors and manages sync lifecycle.
 
-Sync pipeline order:
-  1. devices          - device metadata + overall compliance state
-  2. compliance_policies - policy definitions
-  3. config_policies   - config + settings catalog
-  4. apps              - app metadata + install status
-  5. assignments       - control → group/allDevices assignments
-  6. groups            - group metadata for referenced groups
-  7. memberships       - user/device → group memberships (enables explainability)
-  8. compliance_status - per-device per-policy compliance state
-
-Cooldown: minimum MIN_SYNC_INTERVAL_SECONDS between syncs to prevent
-  accidental double-syncs from rapid UI clicks.
+Pipeline (v1.1.0):
+  1. devices           - device metadata + overall compliance state
+  2. compliance_status - per-device per-policy compliance (device-first)
+  3. compliance_policies
+  4. config_policies   - config + settings catalog + endpoint security
+  5. apps              - app metadata + install status
+  6. remediations      - proactive remediation scripts (deviceHealthScripts) [NEW]
+  7. assignments       - control → group/allDevices assignments
+  8. groups            - group metadata
+  9. memberships       - user/device → group memberships
 """
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable, Optional
 
 from app.config import AppConfig
@@ -26,7 +26,6 @@ from app.db.models import SyncLog
 
 logger = logging.getLogger(__name__)
 
-# Minimum seconds between two manual syncs
 MIN_SYNC_INTERVAL_SECONDS = 90
 
 
@@ -37,15 +36,8 @@ class SyncEvent:
         self.message = message
         self.error = error
 
-    def __repr__(self):
-        return f"<SyncEvent {self.stage} {self.progress}% {self.message}>"
-
 
 class SyncEngine:
-    """
-    Orchestrates all collectors.
-    Thread-safe: uses a class-level lock to prevent concurrent syncs.
-    """
     _last_sync_time: Optional[datetime] = None
 
     def __init__(self, progress_callback: Optional[Callable[[SyncEvent], None]] = None):
@@ -55,7 +47,7 @@ class SyncEngine:
 
     def _emit(self, stage: str, progress: int, message: str, error: bool = False):
         event = SyncEvent(stage, progress, message, error)
-        logger.debug(f"Sync: {event}")
+        logger.debug(f"Sync: {stage} {progress}% {message}")
         if self.progress_callback:
             try:
                 self.progress_callback(event)
@@ -72,23 +64,16 @@ class SyncEngine:
         return (datetime.utcnow() - cls._last_sync_time).total_seconds()
 
     def run_sync(self, components: Optional[list] = None, force: bool = False) -> SyncLog:
-        """
-        Run a full or partial sync.
-        components: subset list or None for all.
-        force: skip cooldown check.
-        """
         if self._running:
-            logger.warning("Sync already running — skipping")
             raise RuntimeError("Sync already running")
 
-        # Cooldown check
         if not force:
             elapsed = SyncEngine.seconds_since_last_sync()
             if elapsed is not None and elapsed < MIN_SYNC_INTERVAL_SECONDS:
                 remaining = int(MIN_SYNC_INTERVAL_SECONDS - elapsed)
-                msg = f"Sync cooldown active — last sync {int(elapsed)}s ago. Wait {remaining}s."
-                logger.info(msg)
-                raise RuntimeError(msg)
+                raise RuntimeError(
+                    f"Sync cooldown active — last sync {int(elapsed)}s ago. Wait {remaining}s."
+                )
 
         self._running = True
         sync_log = self._start_log()
@@ -102,13 +87,14 @@ class SyncEngine:
 
             all_components = components or [
                 "devices",
+                "compliance_status",
                 "compliance_policies",
                 "config_policies",
                 "apps",
-                "assignments",        # assignments first so group sync can resolve referenced group IDs in the same run
+                "remediations",
+                "assignments",
                 "groups",
-                "memberships",        # user/device → group memberships
-                "compliance_status",  # per-device per-policy compliance
+                "memberships",
             ]
             steps = len(all_components)
             results = {}
@@ -125,7 +111,6 @@ class SyncEngine:
                     logger.error(f"Sync component '{comp}' failed: {e}", exc_info=True)
                     results[comp] = {"count": 0, "status": "error", "error": str(e)}
                     self._emit(comp, base_progress, f"{comp} failed: {e}", error=True)
-                    # Continue with remaining components — don't abort entire sync
 
             SyncEngine._last_sync_time = datetime.utcnow()
             self._emit("done", 100, "Sync complete")
@@ -139,41 +124,36 @@ class SyncEngine:
             self._running = False
 
     def _sync_component(self, component: str) -> int:
-        """Dispatch to appropriate collector."""
         from app.graph.client import get_client
         client = get_client()
 
         if component == "devices":
             from app.collector.devices import DeviceCollector
             return DeviceCollector(client).sync_all()
-
-        elif component == "compliance_policies":
-            from app.collector.policies import PolicyCollector
-            return PolicyCollector(client).sync_compliance_policies()
-
-        elif component == "config_policies":
-            from app.collector.policies import PolicyCollector
-            return PolicyCollector(client).sync_config_policies()
-
-        elif component == "apps":
-            from app.collector.apps import AppCollector
-            return AppCollector(client).sync_apps()
-
-        elif component == "groups":
-            from app.collector.groups import GroupCollector
-            return GroupCollector(client).sync_groups()
-
-        elif component == "memberships":
-            from app.collector.memberships import MembershipCollector
-            return MembershipCollector(client).sync_all_memberships()
-
         elif component == "compliance_status":
             from app.collector.compliance_status import ComplianceStatusCollector
             return ComplianceStatusCollector(client).sync_all()
-
+        elif component == "compliance_policies":
+            from app.collector.policies import PolicyCollector
+            return PolicyCollector(client).sync_compliance_policies()
+        elif component == "config_policies":
+            from app.collector.policies import PolicyCollector
+            return PolicyCollector(client).sync_config_policies()
+        elif component == "apps":
+            from app.collector.apps import AppCollector
+            return AppCollector(client).sync_apps()
+        elif component == "remediations":
+            from app.collector.remediations import RemediationCollector
+            return RemediationCollector(client).sync_remediations()
         elif component == "assignments":
             from app.collector.policies import PolicyCollector
             return PolicyCollector(client).sync_all_assignments()
+        elif component == "groups":
+            from app.collector.groups import GroupCollector
+            return GroupCollector(client).sync_groups()
+        elif component == "memberships":
+            from app.collector.memberships import MembershipCollector
+            return MembershipCollector(client).sync_all_memberships()
 
         logger.warning(f"Unknown sync component: {component}")
         return 0
@@ -183,15 +163,12 @@ class SyncEngine:
         from app.demo.demo_data import load_demo_data
         self._emit("demo", 10, "Loading demo data...")
         time.sleep(0.3)
-        self._emit("demo", 60, "Inserting demo devices, policies, apps, memberships...")
+        self._emit("demo", 60, "Inserting demo devices, policies, apps, remediations...")
         count = load_demo_data()
         self._emit("demo", 100, f"Demo data loaded: {count} objects")
         SyncEngine._last_sync_time = datetime.utcnow()
         return self._finish_log(sync_log, "success", {"demo": {"count": count, "status": "ok"}})
 
-    # ------------------------------------------------------------------
-    # SyncLog management
-    # ------------------------------------------------------------------
     def _start_log(self) -> SyncLog:
         with session_scope() as db:
             log = SyncLog(started_at=datetime.utcnow(), status="running")
@@ -225,9 +202,6 @@ class SyncEngine:
         return sync_log
 
 
-# ------------------------------------------------------------------
-# APScheduler integration
-# ------------------------------------------------------------------
 _scheduler = None
 
 
@@ -242,32 +216,24 @@ def get_scheduler():
 def start_scheduler(sync_callback: Optional[Callable] = None):
     cfg = AppConfig()
     if not cfg.sync_enabled:
-        logger.info("Sync scheduler disabled in config")
         return
-
     scheduler = get_scheduler()
     if scheduler.running:
         return
-
     interval = max(cfg.sync_interval_minutes, 5)
 
     def _scheduled_sync():
         engine = SyncEngine()
         try:
-            engine.run_sync(force=True)  # scheduler bypasses cooldown
+            engine.run_sync(force=True)
             if sync_callback:
                 sync_callback()
         except Exception as e:
             logger.error(f"Scheduled sync error: {e}")
 
     scheduler.add_job(
-        _scheduled_sync,
-        "interval",
-        minutes=interval,
-        id="intune_sync",
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
+        _scheduled_sync, "interval", minutes=interval,
+        id="intune_sync", replace_existing=True, coalesce=True, max_instances=1,
     )
     scheduler.start()
     logger.info(f"Sync scheduler started (every {interval} min)")

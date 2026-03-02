@@ -3,10 +3,10 @@ app/ui/pages/policy_explorer_page.py
 
 Policy & App Explorer page.
 
-Changes vs original:
-  • Right-click context menu on policy rows (diff, assigned devices, copy, portal, export)
-  • Multi-select enabled on the policy table (Ctrl+click to pick 2 → compare)
-  • Right-click on app rows (copy, portal link, export)
+Changes:
+  - Right-click context menu on policy rows (diff, assigned devices, copy, portal, export)
+  - Multi-select on the policy table (Ctrl+click two rows → compare)
+  - Right-click on app rows uses the centralised intune_links.app_url() (SettingsMenu/~/0)
 """
 
 from PySide6.QtWidgets import (
@@ -59,17 +59,14 @@ class PolicyExplorerPage(QWidget):
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs)
 
-        # ── Policies tab ──────────────────────────────────────────────────────
         self._policy_widget = QWidget()
         self._tabs.addTab(self._policy_widget, "Policies")
         self._build_policy_tab()
 
-        # ── Apps tab ──────────────────────────────────────────────────────────
         self._app_widget = QWidget()
         self._tabs.addTab(self._app_widget, "Apps")
         self._build_app_tab()
 
-        # ── Assignment detail panel ────────────────────────────────────────────
         self._detail_group = QGroupBox("Assignment Detail")
         detail_layout = QVBoxLayout(self._detail_group)
         self._detail_text = QTextEdit()
@@ -89,13 +86,8 @@ class PolicyExplorerPage(QWidget):
         filter_row = QHBoxLayout()
         self._type_filter = QComboBox()
         self._type_filter.addItems(
-            [
-                "All Types",
-                "compliance_policy",
-                "config_policy",
-                "settings_catalog",
-                "endpoint_security",
-            ]
+            ["All Types", "compliance_policy", "config_policy",
+             "settings_catalog", "endpoint_security"]
         )
         self._type_filter.setMaximumWidth(180)
         self._type_filter.currentTextChanged.connect(self.refresh_policies)
@@ -117,13 +109,8 @@ class PolicyExplorerPage(QWidget):
         self._policy_table = FilterableTable(POLICY_COLUMNS)
         self._policy_table.row_selected.connect(self._on_policy_selected)
         self._policy_table.export_requested.connect(self._export_policies)
-
-        # Multi-select so users can Ctrl+click two policies then right-click → compare
         self._policy_table.set_multi_select(True)
-
-        # Right-click context menu
         self._policy_table.set_context_menu_handler(self._on_policy_context_menu)
-
         layout.addWidget(self._policy_table)
 
     def _build_app_tab(self):
@@ -131,10 +118,7 @@ class PolicyExplorerPage(QWidget):
         layout.setContentsMargins(0, 8, 0, 0)
         self._app_table = FilterableTable(APP_COLUMNS)
         self._app_table.export_requested.connect(self._export_apps)
-
-        # Right-click on apps: copy + export + portal link
         self._app_table.set_context_menu_handler(self._on_app_context_menu)
-
         layout.addWidget(self._app_table)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -147,7 +131,6 @@ class PolicyExplorerPage(QWidget):
 
     def refresh_policies(self):
         from app.analytics.queries import get_controls
-
         ctrl_type = self._type_filter.currentText()
         ctrl_type = "" if ctrl_type == "All Types" else ctrl_type
         data = get_controls(control_type=ctrl_type)
@@ -155,7 +138,6 @@ class PolicyExplorerPage(QWidget):
 
     def refresh_apps(self):
         from app.analytics.queries import get_apps
-
         data = get_apps()
         self._app_table.load_data(data)
 
@@ -166,18 +148,13 @@ class PolicyExplorerPage(QWidget):
             return
 
         from app.analytics.queries import get_assignments_for_control
-
         assignments = get_assignments_for_control(ctrl_id)
         if assignments:
             lines = [f"Assignments for '{row_data.get('display_name', '')}':\n"]
             for a in assignments:
                 intent_icon = "✓ include" if a["intent"] == "include" else "✗ exclude"
-                filter_note = (
-                    f" [filter: {a['filter_id']}]" if a.get("filter_id") else ""
-                )
-                lines.append(
-                    f"  [{intent_icon}] {a['target_type']}: {a['target_id']}{filter_note}"
-                )
+                filter_note = f" [filter: {a['filter_id']}]" if a.get("filter_id") else ""
+                lines.append(f"  [{intent_icon}] {a['target_type']}: {a['target_id']}{filter_note}")
             self._detail_text.setPlainText("\n".join(lines))
         else:
             self._detail_text.setPlainText(
@@ -221,9 +198,13 @@ class PolicyExplorerPage(QWidget):
         )
 
     def _on_app_context_menu(self, row_data: dict, global_pos):
-        """Lightweight context menu for app rows (no diff / device list)."""
-        import json, webbrowser
-        from app.ui.widgets.context_menus import _styled_menu, _add_copy, _export_json, _export_csv, _section_header
+        """App right-click menu — uses centralised portal link builder."""
+        import json
+        from PySide6.QtGui import QAction
+        from app.ui.widgets.context_menus import (
+            _styled_menu, _add_copy, _export_json, _export_csv, _section_header,
+        )
+        from app.utils.intune_links import open_app_portal
 
         app_name = row_data.get("display_name", "Unknown")
         app_id = row_data.get("id", "")
@@ -232,7 +213,6 @@ class PolicyExplorerPage(QWidget):
         menu = _styled_menu(self)
         _section_header(menu, f"📦  {app_name}")
         if publisher:
-            from PySide6.QtGui import QAction
             pub_act = QAction(f"    by {publisher}", menu)
             pub_act.setEnabled(False)
             menu.addAction(pub_act)
@@ -252,20 +232,14 @@ class PolicyExplorerPage(QWidget):
         menu.addSeparator()
 
         if app_id:
-            from PySide6.QtGui import QAction
             act_portal = QAction("🌐  Open in Intune Portal", menu)
-            act_portal.triggered.connect(
-                lambda: webbrowser.open(
-                    f"https://intune.microsoft.com/#view/Microsoft_Intune_Apps"
-                    f"/AppOverview.ReactView/appId/{app_id}"
-                )
-            )
+            # Uses SettingsMenu/~/0 via the centralised builder
+            act_portal.triggered.connect(lambda: open_app_portal(app_id))
             menu.addAction(act_portal)
             menu.addSeparator()
 
         exp_menu = _styled_menu(self)
         exp_menu.setTitle("📤  Export Row…")
-        from PySide6.QtGui import QAction
         ej = QAction("Export as JSON", exp_menu)
         ej.triggered.connect(lambda: _export_json(row_data, self))
         exp_menu.addAction(ej)

@@ -8,6 +8,9 @@ Context menu builders + inline dialogs for:
 
 Each builder receives the row data dict, the global QPoint for positioning,
 the parent widget, and optional callbacks for inter-page navigation.
+
+Portal URL construction is fully delegated to app.utils.intune_links —
+this module does NOT build any portal URLs directly.
 """
 
 from __future__ import annotations
@@ -129,23 +132,19 @@ def _export_csv(data: dict, parent=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Datetime helper (mirrors app/collector/devices.py)
+# Datetime helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_dt(val) -> "Optional[datetime]":
-    """Parse an ISO-8601 string from Graph API into a Python datetime.
-    SQLite/SQLAlchemy requires a real datetime object, not a string.
-    Handles formats like '2026-02-25T17:19:57.4793576Z'.
-    """
+    """Parse an ISO-8601 string from Graph API into a Python datetime."""
     if val is None or not isinstance(val, str):
-        return val  # already a datetime or None — pass through
+        return val
     try:
         return datetime.fromisoformat(val.replace("Z", "+00:00"))
     except Exception:
         try:
-            # Fallback: strip sub-second to 6 digits (Python max) and retry
             import re
-            val2 = re.sub(r"(\.\d{6})\d+", r"", val).replace("Z", "+00:00")
+            val2 = re.sub(r"(\.\d{6})\d+", r"\1", val).replace("Z", "+00:00")
             return datetime.fromisoformat(val2)
         except Exception:
             logger.warning(f"Could not parse datetime string: {val!r}")
@@ -153,31 +152,24 @@ def _parse_dt(val) -> "Optional[datetime]":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Intune / Entra portal URL builders
+# Portal openers — thin wrappers around app.utils.intune_links
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _url_device_intune(device_id: str) -> str:
-    return (
-        "https://intune.microsoft.com/#view/Microsoft_Intune_Devices"
-        f"/DeviceSettingsMenuBlade/~/overview/mdmDeviceId/{device_id}"
-    )
+def _open_device_intune(device_id: str) -> None:
+    from app.utils.intune_links import open_device_portal
+    open_device_portal(device_id)
 
 
 def _open_entra_device(intune_device_id: str, parent_widget) -> None:
     """
     Open the correct Entra portal page for a device.
 
-    The Entra portal deep-link requires the Entra **Object ID** (device.id from
-    the Entra /devices endpoint), which is DIFFERENT from:
-      - The Intune managed device ID  (stored as Device.id in our DB)
-      - The Azure AD Device ID        (stored as Device.azure_ad_device_id, = Entra deviceId)
-
     Strategy:
-      1. Read azure_ad_device_id from local DB  (fast, no network)
-      2. Live-query Graph:  GET /devices?$filter=deviceId eq '{azureADDeviceId}'&$select=id
+      1. Read azure_ad_device_id from local DB (fast, no network).
+      2. Live-query Graph:  GET /devices?$filter=deviceId eq '{aadId}'&$select=id
          to get the true Entra Object ID.
       3. Open the deep-link with the Object ID.
-      4. On any failure (no permission, not in Entra, offline), open the list page.
+      4. On any failure, open the device list page.
     """
     try:
         from app.db.database import session_scope
@@ -192,13 +184,11 @@ def _open_entra_device(intune_device_id: str, parent_widget) -> None:
         azure_ad_device_id = None
 
     if not azure_ad_device_id:
-        logger.debug(f"Entra: no azure_ad_device_id for {intune_device_id} — opening list")
         webbrowser.open(
             "https://entra.microsoft.com/#view/Microsoft_AAD_Devices/DevicesMenuBlade/~/AllDevices"
         )
         return
 
-    # Live Graph query to get the Entra Object ID from the Azure AD Device ID
     try:
         from app.graph.client import get_client
         client = get_client()
@@ -220,111 +210,16 @@ def _open_entra_device(intune_device_id: str, parent_widget) -> None:
             "https://entra.microsoft.com/#view/Microsoft_AAD_Devices"
             f"/DeviceDetailsMenuBlade/~/Properties/objectId/{entra_object_id}"
         )
-        logger.debug(f"Entra: opening {url}")
     else:
-        logger.debug(
-            f"Entra: Object ID not found for azureADDeviceId={azure_ad_device_id} "
-            f"(may need Device.Read.All permission) — opening list"
-        )
         url = "https://entra.microsoft.com/#view/Microsoft_AAD_Devices/DevicesMenuBlade/~/AllDevices"
 
     webbrowser.open(url)
 
 
-# Platform name normalisation: Control.platform / raw_json "platforms" → URL segment
-_PLATFORM_MAP = {
-    "windows":   "windows10",
-    "windows10": "windows10",
-    "ios":       "iOS",
-    "android":   "android",
-    "macos":     "macOS",
-    "osx":       "macOS",
-    "all":       "windows10",   # safe fallback
-}
-
-
-def _norm_platform(raw_platform: str) -> str:
-    """Normalise a stored platform value to the Intune portal URL segment."""
-    if not raw_platform:
-        return "windows10"
-    # raw_platform can be comma-separated (e.g. "windows10,macOS") — take first
-    first = raw_platform.split(",")[0].strip().lower()
-    return _PLATFORM_MAP.get(first, first)
-
-
-def _open_policy_portal(policy_id: str, policy_type: str, parent_widget) -> None:
-    """
-    Open the Intune portal page for a policy.
-
-    PolicySummaryBlade requires: isAssigned~ / technology / templateId / platformName
-    (the old policyType parameter no longer works and causes "missing parameter" errors).
-
-    Values are read from Control.raw_json stored at sync time.
-    Fallback: open the Intune policy list so the user is never left with nothing.
-    """
-    import json as _json
-
-    is_assigned_str = "true"
-    technology = "mdm"
-    template_id = ""
-    platform = "windows10"
-
-    try:
-        from app.db.database import session_scope
-        from app.db.models import Control
-
-        with session_scope() as db:
-            ctrl = db.get(Control, policy_id)
-            if ctrl:
-                is_assigned_str = "true" if ctrl.is_assigned else "false"
-                platform = _norm_platform(ctrl.platform or "")
-                raw = {}
-                if ctrl.raw_json:
-                    try:
-                        raw = _json.loads(ctrl.raw_json) if isinstance(ctrl.raw_json, str) else ctrl.raw_json
-                    except Exception:
-                        pass
-                # settings_catalog / endpoint_security (beta API) have platforms+technologies
-                if raw.get("platforms"):
-                    platform = _norm_platform(raw["platforms"])
-                if raw.get("technologies"):
-                    # technologies can be "mdm,microsoftSense" — take the first token
-                    technology = raw["technologies"].split(",")[0].strip()
-                tmpl = raw.get("templateReference") or {}
-                if isinstance(tmpl, dict):
-                    template_id = tmpl.get("templateId", "") or ""
-
-                # Classic config_policy (deviceConfigurations, v1.0 API) does NOT have
-                # platforms/technologies in raw_json — infer platform from @odata.type.
-                # This also handles cases where _infer_platform() returned "unknown".
-                if not raw.get("platforms") and raw.get("@odata.type"):
-                    odata_lower = raw["@odata.type"].lower()
-                    if "ios" in odata_lower:
-                        platform = "iOS"
-                    elif "android" in odata_lower:
-                        platform = "android"
-                    elif "macos" in odata_lower or "osx" in odata_lower:
-                        platform = "macOS"
-                    elif "windows" in odata_lower:
-                        platform = "windows10"
-                    # technology stays "mdm" — correct for all classic config policies
-
-                # compliance_policy: technology is "mdm", no templateId, platform from
-                # @odata.type (e.g. #microsoft.graph.windows10CompliancePolicy → windows10).
-                # The defaults above handle this correctly.
-    except Exception as e:
-        logger.debug(f"Policy portal DB lookup failed for {policy_id}: {e}")
-
-    url = (
-        "https://intune.microsoft.com/#view/Microsoft_Intune_Workflows"
-        f"/PolicySummaryBlade/policyId/{policy_id}"
-        f"/isAssigned~/{is_assigned_str}"
-        f"/technology/{technology}"
-        f"/templateId/{template_id}"
-        f"/platformName/{platform}"
-    )
-    logger.debug(f"Opening policy portal: {url}")
-    webbrowser.open(url)
+def _open_policy_portal(policy_id: str, policy_type: str, parent_widget=None) -> None:
+    """Open the Intune portal for a policy using the centralised link builder."""
+    from app.utils.intune_links import open_policy_portal
+    open_policy_portal(policy_id, policy_type)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -350,7 +245,6 @@ class _DeviceSyncWorker(QThread):
                 self.done.emit(False, "demo_mode")
                 return
 
-            # get_client() reuses the authenticated singleton — no extra auth flow needed
             try:
                 client = get_client()
             except Exception:
@@ -374,26 +268,14 @@ class _DeviceSyncWorker(QThread):
                 return
 
             with session_scope() as db:
-                dev = (
-                    db.query(Device)
-                    .filter(Device.id == self._device_id)
-                    .first()
-                )
+                dev = db.query(Device).filter(Device.id == self._device_id).first()
                 if dev:
                     dev.device_name = dev_data.get("deviceName", dev.device_name)
-                    dev.compliance_state = dev_data.get(
-                        "complianceState", dev.compliance_state
-                    )
+                    dev.compliance_state = dev_data.get("complianceState", dev.compliance_state)
                     dev.last_sync_date_time = _parse_dt(dev_data.get("lastSyncDateTime"))
                     dev.os_version = dev_data.get("osVersion", dev.os_version)
                     dev.synced_at = datetime.utcnow()
-                    logger.info(
-                        f"Force-synced device {dev.device_name} ({self._device_id[:8]}…)"
-                    )
-                else:
-                    logger.warning(
-                        f"Device {self._device_id} not in local DB after Graph fetch"
-                    )
+                    logger.info(f"Force-synced device {dev.device_name} ({self._device_id[:8]}…)")
 
             name = dev_data.get("deviceName", self._device_id)
             self.done.emit(True, name)
@@ -405,9 +287,7 @@ class _DeviceSyncWorker(QThread):
 def _force_sync_device(device_id: str, device_name: str, parent, on_done=None):
     from app.config import AppConfig
     if AppConfig().demo_mode:
-        QMessageBox.information(
-            parent, "Demo Mode", "Force sync is not available in demo mode."
-        )
+        QMessageBox.information(parent, "Demo Mode", "Force sync is not available in demo mode.")
         return
 
     progress = QProgressDialog(
@@ -419,7 +299,6 @@ def _force_sync_device(device_id: str, device_name: str, parent, on_done=None):
     progress.show()
 
     worker = _DeviceSyncWorker(device_id)
-    # Keep alive
     parent._sync_worker_ref = worker  # type: ignore[attr-defined]
 
     def _finish(success: bool, msg: str):
@@ -432,9 +311,7 @@ def _force_sync_device(device_id: str, device_name: str, parent, on_done=None):
             if on_done:
                 on_done()
         elif msg == "demo_mode":
-            QMessageBox.information(
-                parent, "Demo Mode", "Force sync is not available in demo mode."
-            )
+            QMessageBox.information(parent, "Demo Mode", "Force sync is not available in demo mode.")
         elif msg == "no_token":
             QMessageBox.warning(
                 parent, "Auth Error",
@@ -476,7 +353,6 @@ class PolicyDiffDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(8)
 
-        # Header row
         hdr = QHBoxLayout()
         lbl_a = QLabel(f"◀  {self._pa.get('display_name', 'Policy A')}")
         lbl_a.setStyleSheet("font-size: 14px; font-weight: bold; color: #89dceb;")
@@ -488,16 +364,12 @@ class PolicyDiffDialog(QDialog):
         hdr.addWidget(lbl_b)
         lay.addLayout(hdr)
 
-        # Legend
-        legend = QLabel(
-            "  🟦 Only in A   🟧 Only in B   🔴 Different values   ✅ Identical"
-        )
+        legend = QLabel("  🟦 Only in A   🟧 Only in B   🔴 Different values   ✅ Identical")
         legend.setStyleSheet(
             "color: #a6adc8; font-size: 12px; padding: 4px 0; border-bottom: 1px solid #45475a;"
         )
         lay.addWidget(legend)
 
-        # Tree
         self._tree = QTreeWidget()
         self._tree.setColumnCount(3)
         self._tree.setHeaderLabels(["Setting / Key", "Policy A", "Policy B"])
@@ -509,14 +381,12 @@ class PolicyDiffDialog(QDialog):
         self._tree.setSortingEnabled(True)
         lay.addWidget(self._tree)
 
-        # Summary
         self._summary = QLabel()
         self._summary.setStyleSheet(
             "color: #a6adc8; font-size: 12px; padding: 4px; border-top: 1px solid #45475a;"
         )
         lay.addWidget(self._summary)
 
-        # Buttons
         btns = QDialogButtonBox(QDialogButtonBox.Close)
         exp_btn = QPushButton("📤  Export Diff as JSON")
         exp_btn.clicked.connect(self._export)
@@ -537,11 +407,7 @@ class PolicyDiffDialog(QDialog):
         return out
 
     def _populate(self):
-        # Skip noisy metadata keys
-        _SKIP = {
-            "id", "createdDateTime", "lastModifiedDateTime",
-            "version", "settingCount",
-        }
+        _SKIP = {"id", "createdDateTime", "lastModifiedDateTime", "version", "settingCount"}
         flat_a = {k: v for k, v in self._flatten(self._pa).items() if k not in _SKIP}
         flat_b = {k: v for k, v in self._flatten(self._pb).items() if k not in _SKIP}
 
@@ -554,23 +420,17 @@ class PolicyDiffDialog(QDialog):
             item = QTreeWidgetItem([key, va or "—", vb or "—"])
 
             if va is None:
-                # Only in B
-                for col in (0, 2):
-                    item.setForeground(col, QColor("#f9e2af"))
+                for col in (0, 2): item.setForeground(col, QColor("#f9e2af"))
                 only_b += 1
             elif vb is None:
-                # Only in A
-                for col in (0, 1):
-                    item.setForeground(col, QColor("#89dceb"))
+                for col in (0, 1): item.setForeground(col, QColor("#89dceb"))
                 only_a += 1
             elif va != vb:
-                for col in range(3):
-                    item.setForeground(col, QColor("#f38ba8"))
+                for col in range(3): item.setForeground(col, QColor("#f38ba8"))
                 different += 1
             else:
                 item.setForeground(0, QColor("#6c7086"))
-                for col in (1, 2):
-                    item.setForeground(col, QColor("#a6e3a1"))
+                for col in (1, 2): item.setForeground(col, QColor("#a6e3a1"))
                 identical += 1
 
             self._tree.addTopLevelItem(item)
@@ -587,24 +447,19 @@ class PolicyDiffDialog(QDialog):
             "policy_a": self._pa.get("display_name"),
             "policy_b": self._pb.get("display_name"),
             "summary": {
-                "total": len(all_keys),
-                "identical": identical,
-                "different": different,
-                "only_in_a": only_a,
-                "only_in_b": only_b,
+                "total": len(all_keys), "identical": identical,
+                "different": different, "only_in_a": only_a, "only_in_b": only_b,
             },
             "differences": [
                 {"key": k, "policy_a": flat_a.get(k), "policy_b": flat_b.get(k)}
-                for k in all_keys
-                if flat_a.get(k) != flat_b.get(k)
+                for k in all_keys if flat_a.get(k) != flat_b.get(k)
             ],
         }
 
     def _export(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Policy Diff",
-            f"policy_diff_{ts}.json", "JSON Files (*.json)"
+            self, "Export Policy Diff", f"policy_diff_{ts}.json", "JSON Files (*.json)"
         )
         if path:
             with open(path, "w", encoding="utf-8") as f:
@@ -619,13 +474,7 @@ class PolicyDiffDialog(QDialog):
 class DriftDetailDialog(QDialog):
     """Shows before/after snapshot JSON for a single drift change row."""
 
-    def __init__(
-        self,
-        row_data: dict,
-        baseline_id: int,
-        current_id: int,
-        parent=None,
-    ):
+    def __init__(self, row_data: dict, baseline_id: int, current_id: int, parent=None):
         super().__init__(parent)
         self._row = row_data
         self._baseline_id = baseline_id
@@ -662,7 +511,6 @@ class DriftDetailDialog(QDialog):
             fl.setStyleSheet("color: #a6adc8; font-size: 12px; margin-bottom: 4px;")
             lay.addWidget(fl)
 
-        # Side-by-side splitter
         splitter = QSplitter(Qt.Horizontal)
 
         def _panel(title: str, color: str) -> QTextEdit:
@@ -674,19 +522,13 @@ class DriftDetailDialog(QDialog):
             wl.addWidget(lbl)
             te = QTextEdit()
             te.setReadOnly(True)
-            te.setStyleSheet(
-                "font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;"
-            )
+            te.setStyleSheet("font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;")
             wl.addWidget(te)
             splitter.addWidget(w)
             return te
 
-        self._baseline_te = _panel(
-            f"📸  Baseline  (Snapshot #{self._baseline_id})", "#89dceb"
-        )
-        self._current_te = _panel(
-            f"📸  Current   (Snapshot #{self._current_id})", "#f9e2af"
-        )
+        self._baseline_te = _panel(f"📸  Baseline  (Snapshot #{self._baseline_id})", "#89dceb")
+        self._current_te = _panel(f"📸  Current   (Snapshot #{self._current_id})", "#f9e2af")
         lay.addWidget(splitter)
 
         btns = QDialogButtonBox(QDialogButtonBox.Close)
@@ -706,22 +548,14 @@ class DriftDetailDialog(QDialog):
             from app.db.models import SnapshotItem
 
             with session_scope() as db:
-                bl = (
-                    db.query(SnapshotItem)
-                    .filter(
-                        SnapshotItem.snapshot_id == self._baseline_id,
-                        SnapshotItem.entity_id == entity_id,
-                    )
-                    .first()
-                )
-                cu = (
-                    db.query(SnapshotItem)
-                    .filter(
-                        SnapshotItem.snapshot_id == self._current_id,
-                        SnapshotItem.entity_id == entity_id,
-                    )
-                    .first()
-                )
+                bl = db.query(SnapshotItem).filter(
+                    SnapshotItem.snapshot_id == self._baseline_id,
+                    SnapshotItem.entity_id == entity_id,
+                ).first()
+                cu = db.query(SnapshotItem).filter(
+                    SnapshotItem.snapshot_id == self._current_id,
+                    SnapshotItem.entity_id == entity_id,
+                ).first()
 
             def _render(ctrl) -> str:
                 if ctrl is None:
@@ -756,7 +590,7 @@ class PolicyDevicesDialog(QDialog):
     Strategy depends on policy type:
       - compliance_policy   → query DeviceComplianceStatus (per-device evaluation state)
       - all other types     → query Assignment → DeviceGroupMembership → Device
-                              (which devices are in scope via group targeting)
+                              (devices in scope via group targeting)
     """
 
     def __init__(self, policy_id: str, policy_name: str, policy_type: str = "", parent=None):
@@ -835,33 +669,21 @@ class PolicyDevicesDialog(QDialog):
             }
 
             with session_scope() as db:
-                # Primary lookup: policy_id == Control.id
                 rows = (
                     db.query(DeviceComplianceStatus)
                     .filter(DeviceComplianceStatus.policy_id == self._policy_id)
                     .order_by(DeviceComplianceStatus.status)
                     .all()
                 )
-
-                # Fallback: compliance_status.py sometimes stores the raw Graph state_id
-                # as policy_id when the display-name→control-id mapping failed.
-                # Match by policy_display_name using the control's display_name.
                 if not rows:
                     ctrl = db.get(Control, self._policy_id)
                     if ctrl and ctrl.display_name:
                         rows = (
                             db.query(DeviceComplianceStatus)
-                            .filter(
-                                DeviceComplianceStatus.policy_display_name == ctrl.display_name
-                            )
+                            .filter(DeviceComplianceStatus.policy_display_name == ctrl.display_name)
                             .order_by(DeviceComplianceStatus.status)
                             .all()
                         )
-                        if rows:
-                            logger.debug(
-                                f"PolicyDevicesDialog compliance: matched {len(rows)} rows "
-                                f"via display_name fallback for {self._policy_id}"
-                            )
 
                 result = []
                 for r in rows:
@@ -891,7 +713,7 @@ class PolicyDevicesDialog(QDialog):
                 self._info.setText(f"{len(result)} device compliance record(s) found.")
             else:
                 self._info.setText(
-                    "No per-device compliance records found for this policy.  "
+                    "No per-device compliance records found for this policy. "
                     "The compliance_status sync must complete at least once after a full sync."
                 )
         except Exception as e:
@@ -901,9 +723,7 @@ class PolicyDevicesDialog(QDialog):
     def _load_via_assignments(self):
         """
         Load devices in scope for config / settings_catalog / endpoint_security policies.
-
-        Chain: Assignment (include) → group_id → DeviceGroupMembership → Device
-        allDevices / allUsers assignments are shown as a note, not as a device list.
+        Chain: Assignment (include) → group_id → DeviceGroupMembership → Device.
         """
         try:
             from app.db.database import session_scope
@@ -928,25 +748,20 @@ class PolicyDevicesDialog(QDialog):
                     if a.target_type == "group" and a.target_id
                 ]
 
-                # Group name map
                 group_names: dict[str, str] = {}
                 if group_ids:
                     grps = db.query(Group).filter(Group.id.in_(group_ids)).all()
                     group_names = {g.id: (g.display_name or g.id) for g in grps}
 
-                # Device lookup via DeviceGroupMembership
                 result = []
-                seen_device_ids: set[str] = set()
+                seen: set[str] = set()
                 for gid in group_ids:
-                    memberships = (
-                        db.query(DeviceGroupMembership)
-                        .filter(DeviceGroupMembership.group_id == gid)
-                        .all()
-                    )
-                    for m in memberships:
-                        if m.device_id in seen_device_ids:
+                    for m in db.query(DeviceGroupMembership).filter(
+                        DeviceGroupMembership.group_id == gid
+                    ).all():
+                        if m.device_id in seen:
                             continue
-                        seen_device_ids.add(m.device_id)
+                        seen.add(m.device_id)
                         dev = db.get(Device, m.device_id)
                         if dev:
                             result.append({
@@ -992,18 +807,6 @@ def build_device_context_menu(
     on_explain: Optional[Callable[[str], None]] = None,
     on_refresh_table: Optional[Callable[[], None]] = None,
 ):
-    """
-    Build and exec the device right-click context menu.
-
-    Parameters
-    ----------
-    row_data        : dict from FilterableTable (device record)
-    pos             : global screen position for the menu
-    parent_widget   : owning widget (for dialogs)
-    on_view_detail  : callback(device_id) → navigate to Device Detail page
-    on_explain      : callback(device_id) → navigate to Explain State page
-    on_refresh_table: callback() → refresh Device Explorer table after sync
-    """
     device_id = row_data.get("id", "")
     device_name = row_data.get("device_name", "Unknown")
     serial = row_data.get("serial_number", "")
@@ -1013,7 +816,6 @@ def build_device_context_menu(
 
     menu = _styled_menu(parent_widget)
 
-    # ── Header ──────────────────────────────────────────────────────────────
     _section_header(menu, f"🖥️  {device_name}")
     if os_name or compliance:
         meta = QAction(f"    {os_name}  ·  {compliance}", menu)
@@ -1021,7 +823,6 @@ def build_device_context_menu(
         menu.addAction(meta)
     menu.addSeparator()
 
-    # ── Navigation ──────────────────────────────────────────────────────────
     act_detail = QAction("📋  View Device Details", menu)
     if on_view_detail and device_id:
         act_detail.triggered.connect(lambda: on_view_detail(device_id))
@@ -1038,7 +839,6 @@ def build_device_context_menu(
 
     menu.addSeparator()
 
-    # ── Sync ─────────────────────────────────────────────────────────────────
     act_sync = QAction("↻  Force Sync This Device", menu)
     if device_id:
         act_sync.triggered.connect(
@@ -1050,10 +850,8 @@ def build_device_context_menu(
 
     menu.addSeparator()
 
-    # ── Copy submenu ─────────────────────────────────────────────────────────
     copy_menu = _styled_menu(parent_widget)
     copy_menu.setTitle("📋  Copy…")
-
     _add_copy(copy_menu, f"Device Name       {device_name}", device_name)
     if device_id:
         short_id = f"{device_id[:8]}…" if len(device_id) > 8 else device_id
@@ -1068,12 +866,9 @@ def build_device_context_menu(
 
     menu.addSeparator()
 
-    # ── Open in portal ────────────────────────────────────────────────────────
     act_intune = QAction("🌐  Open in Intune Portal", menu)
     if device_id:
-        act_intune.triggered.connect(
-            lambda: webbrowser.open(_url_device_intune(device_id))
-        )
+        act_intune.triggered.connect(lambda: _open_device_intune(device_id))
     else:
         act_intune.setEnabled(False)
     menu.addAction(act_intune)
@@ -1084,7 +879,6 @@ def build_device_context_menu(
 
     menu.addSeparator()
 
-    # ── Export submenu ───────────────────────────────────────────────────────
     exp_menu = _styled_menu(parent_widget)
     exp_menu.setTitle("📤  Export Row…")
     act_ej = QAction("Export as JSON", exp_menu)
@@ -1115,18 +909,6 @@ def build_policy_context_menu(
     get_selected_rows: Optional[Callable[[], list[dict]]] = None,
     on_explain: Optional[Callable[[str], None]] = None,
 ):
-    """
-    Build and exec the policy right-click context menu.
-
-    Parameters
-    ----------
-    row_data         : dict of the right-clicked policy row
-    pos              : global screen position
-    parent_widget    : owning widget
-    get_selected_rows: callable() → list of currently selected row dicts
-                       (used to enable the "Compare 2 policies" action)
-    on_explain       : callback(policy_id) → navigate to Explain State
-    """
     policy_id = row_data.get("id", "")
     policy_name = row_data.get("display_name", "Unknown")
     policy_type = row_data.get("control_type", "")
@@ -1134,16 +916,12 @@ def build_policy_context_menu(
 
     menu = _styled_menu(parent_widget)
 
-    # ── Header ───────────────────────────────────────────────────────────────
     _section_header(menu, f"📑  {policy_name}")
     meta = QAction(f"    {policy_type}  ·  {assignments} assignment(s)", menu)
     meta.setEnabled(False)
     menu.addAction(meta)
     menu.addSeparator()
 
-    # ── Assigned devices ──────────────────────────────────────────────────────
-    # Works for all policy types: compliance uses DeviceComplianceStatus;
-    # config/settings_catalog/endpoint_security use Assignment targets.
     act_devices = QAction("🖥️  Show Assigned Devices", menu)
     if policy_id:
         act_devices.triggered.connect(
@@ -1153,18 +931,15 @@ def build_policy_context_menu(
         act_devices.setEnabled(False)
     menu.addAction(act_devices)
 
-    # ── Policy diff ───────────────────────────────────────────────────────────
     selected = get_selected_rows() if get_selected_rows else []
-    # Filter to unique IDs (ignore current row already counted)
-    selected_ids = [r.get("id") for r in selected]
 
     if len(selected) == 2:
-        act_diff = QAction(f"⚖️  Compare Selected Policies (2 selected)", menu)
+        act_diff = QAction("⚖️  Compare Selected Policies (2 selected)", menu)
         act_diff.triggered.connect(
             lambda: _show_policy_diff(selected[0], selected[1], parent_widget)
         )
     elif len(selected) > 2:
-        act_diff = QAction(f"⚖️  Compare Policies (select exactly 2)", menu)
+        act_diff = QAction("⚖️  Compare Policies (select exactly 2)", menu)
         act_diff.setEnabled(False)
     else:
         act_diff = QAction("⚖️  Compare Policies (Ctrl+click to select 2)", menu)
@@ -1173,7 +948,6 @@ def build_policy_context_menu(
 
     menu.addSeparator()
 
-    # ── Copy submenu ─────────────────────────────────────────────────────────
     copy_menu = _styled_menu(parent_widget)
     copy_menu.setTitle("📋  Copy…")
     _add_copy(copy_menu, f"Policy Name       {policy_name}", policy_name)
@@ -1187,7 +961,6 @@ def build_policy_context_menu(
 
     menu.addSeparator()
 
-    # ── Open in portal ────────────────────────────────────────────────────────
     act_intune = QAction("🌐  Open in Intune Portal", menu)
     if policy_id:
         act_intune.triggered.connect(
@@ -1199,7 +972,6 @@ def build_policy_context_menu(
 
     menu.addSeparator()
 
-    # ── Export ────────────────────────────────────────────────────────────────
     exp_menu = _styled_menu(parent_widget)
     exp_menu.setTitle("📤  Export Row…")
     act_ej = QAction("Export as JSON", exp_menu)
@@ -1214,33 +986,22 @@ def build_policy_context_menu(
 
 
 def _show_policy_diff(policy_a: dict, policy_b: dict, parent):
-    """Load richer policy data from DB then open the diff dialog."""
     a_full = _enrich_policy(policy_a)
     b_full = _enrich_policy(policy_b)
     PolicyDiffDialog(a_full, b_full, parent).exec()
 
 
 def _enrich_policy(policy: dict) -> dict:
-    """Try to add raw_json data from DB to supplement the table row dict."""
     try:
         from app.db.database import session_scope
         from app.db.models import Control
-
         pid = policy.get("id", "")
         if not pid:
             return policy
         with session_scope() as db:
-            row = (
-                db.query(Control)
-                .filter(Control.id == pid)
-                .first()
-            )
+            row = db.query(Control).filter(Control.id == pid).first()
             if row and row.raw_json:
-                raw = (
-                    json.loads(row.raw_json)
-                    if isinstance(row.raw_json, str)
-                    else row.raw_json
-                )
+                raw = json.loads(row.raw_json) if isinstance(row.raw_json, str) else row.raw_json
                 merged = dict(policy)
                 merged.update(raw)
                 return merged
@@ -1263,11 +1024,9 @@ def build_snapshot_context_menu(
     on_delete: Optional[Callable[[int], None]] = None,
 ):
     menu = _styled_menu(parent_widget)
-
     _section_header(menu, f"📸  {snap_name or f'Snapshot #{snap_id}'}")
     menu.addSeparator()
 
-    # ── Use in comparison ─────────────────────────────────────────────────────
     act_bl = QAction("◀  Use as Baseline for Compare", menu)
     if on_set_baseline:
         act_bl.triggered.connect(lambda: on_set_baseline(snap_id))
@@ -1284,7 +1043,6 @@ def build_snapshot_context_menu(
 
     menu.addSeparator()
 
-    # ── Copy ──────────────────────────────────────────────────────────────────
     copy_menu = _styled_menu(parent_widget)
     copy_menu.setTitle("📋  Copy…")
     _add_copy(copy_menu, f"Snapshot Name  {snap_name}", snap_name)
@@ -1293,9 +1051,7 @@ def build_snapshot_context_menu(
 
     menu.addSeparator()
 
-    # ── Delete ────────────────────────────────────────────────────────────────
     act_del = QAction("🗑️  Delete Snapshot…", menu)
-    act_del.setObjectName("danger")
     act_del.setStyleSheet("color: #f38ba8;")
     if on_delete:
         act_del.triggered.connect(
@@ -1312,9 +1068,7 @@ def _confirm_delete_snapshot(snap_id, snap_name, parent, on_delete):
     reply = QMessageBox.question(
         parent,
         "Delete Snapshot",
-        f"Permanently delete snapshot:\n\n"
-        f"  '{snap_name}'  (ID: {snap_id})\n\n"
-        "This cannot be undone.",
+        f"Permanently delete snapshot:\n\n  '{snap_name}'  (ID: {snap_id})\n\nThis cannot be undone.",
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.No,
     )
@@ -1322,9 +1076,7 @@ def _confirm_delete_snapshot(snap_id, snap_name, parent, on_delete):
         try:
             from app.db.database import session_scope
             from app.db.models import Snapshot, SnapshotItem
-
             with session_scope() as db:
-                # Delete child items first (cascade may not fire on bulk delete)
                 db.query(SnapshotItem).filter(
                     SnapshotItem.snapshot_id == snap_id
                 ).delete(synchronize_session=False)
@@ -1349,16 +1101,6 @@ def build_drift_context_menu(
     on_navigate_policy: Optional[Callable[[str], None]] = None,
     on_navigate_device: Optional[Callable[[str], None]] = None,
 ):
-    """
-    Parameters
-    ----------
-    row_data         : drift row dict (keys: change_type, entity_type, display_name,
-                       changed_fields, entity_id)
-    baseline_id      : ID of the baseline snapshot
-    current_id       : ID of the current snapshot
-    on_navigate_policy : callback(policy_id) → go to policy explorer filtered
-    on_navigate_device : callback(device_id) → go to device detail
-    """
     change_type = str(row_data.get("change_type", "")).upper()
     entity_name = row_data.get("display_name", row_data.get("entity_name", "Unknown"))
     entity_type = row_data.get("entity_type", "")
@@ -1369,7 +1111,6 @@ def build_drift_context_menu(
     icon = icon_map.get(change_type, "🔵")
 
     menu = _styled_menu(parent_widget)
-
     _section_header(menu, f"{icon}  {change_type}  ·  {entity_name}")
     if entity_type:
         meta = QAction(f"    Type: {entity_type}", menu)
@@ -1377,14 +1118,12 @@ def build_drift_context_menu(
         menu.addAction(meta)
     menu.addSeparator()
 
-    # ── Before / After detail ─────────────────────────────────────────────────
     act_detail = QAction("🔬  View Before / After Details", menu)
     act_detail.triggered.connect(
         lambda: DriftDetailDialog(row_data, baseline_id, current_id, parent_widget).exec()
     )
     menu.addAction(act_detail)
 
-    # ── Navigate to entity ────────────────────────────────────────────────────
     if entity_id:
         et_lower = entity_type.lower()
         if "device" in et_lower and on_navigate_device:
@@ -1399,11 +1138,9 @@ def build_drift_context_menu(
 
     menu.addSeparator()
 
-    # ── Copy submenu ──────────────────────────────────────────────────────────
     copy_menu = _styled_menu(parent_widget)
     copy_menu.setTitle("📋  Copy…")
-    summary = f"{change_type} | {entity_type} | {entity_name}"
-    _add_copy(copy_menu, "Change Summary", summary)
+    _add_copy(copy_menu, "Change Summary", f"{change_type} | {entity_type} | {entity_name}")
     if entity_id:
         _add_copy(copy_menu, "Entity ID", entity_id)
     if changed_fields:
@@ -1414,7 +1151,6 @@ def build_drift_context_menu(
 
     menu.addSeparator()
 
-    # ── Export ────────────────────────────────────────────────────────────────
     act_exp = QAction("📤  Export Row as JSON", menu)
     act_exp.triggered.connect(lambda: _export_json(row_data, parent_widget))
     menu.addAction(act_exp)

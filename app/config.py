@@ -10,7 +10,6 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# Application data directory
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "IntuneDashboard"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -22,7 +21,7 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 MSAL_CACHE_PATH = APP_DIR / "msal_cache.bin"
 CONFIG_PATH = APP_DIR / "config.json"
 
-GRAPH_BASE_URL_V1 = "https://graph.microsoft.com/v1.0"
+GRAPH_BASE_URL_V1   = "https://graph.microsoft.com/v1.0"
 GRAPH_BASE_URL_BETA = "https://graph.microsoft.com/beta"
 
 DEFAULT_SCOPES = [
@@ -33,12 +32,14 @@ DEFAULT_SCOPES = [
     "https://graph.microsoft.com/User.Read.All",
     "https://graph.microsoft.com/Device.Read.All",
     "https://graph.microsoft.com/DeviceManagementRBAC.Read.All",
+    # Required for Remediations "Run on Device" action
+    "https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All",
 ]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "tenant_id": "",
     "client_id": "",
-    "auth_mode": "device_code",  # or "app_only"
+    "auth_mode": "device_code",
     "cert_thumbprint": "",
     "cert_path": "",
     "db_path": str(DB_PATH),
@@ -51,8 +52,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 class AppConfig:
-    """Singleton config manager backed by JSON file."""
-
     _instance: Optional["AppConfig"] = None
     _data: Dict[str, Any] = {}
 
