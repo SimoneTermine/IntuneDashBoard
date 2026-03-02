@@ -1,6 +1,7 @@
 """
 Database models for Intune Dashboard.
 Unified model: Control → Assignment → Outcome per device.
+v1.2.1: Removed Remediation model (Proactive Remediations feature removed).
 """
 
 from datetime import datetime
@@ -24,15 +25,15 @@ class Device(Base):
     """Represents a managed device from Intune."""
     __tablename__ = "devices"
 
-    id = Column(String, primary_key=True)  # Graph device id
+    id = Column(String, primary_key=True)
     device_name = Column(String, index=True)
     serial_number = Column(String, index=True)
-    device_type = Column(String)  # windows, ios, android, macos
+    device_type = Column(String)
     operating_system = Column(String)
     os_version = Column(String)
-    compliance_state = Column(String, index=True)  # compliant/noncompliant/unknown/error/conflict/notApplicable
+    compliance_state = Column(String, index=True)
     management_state = Column(String)
-    ownership = Column(String)  # company/personal/unknown
+    ownership = Column(String)
     enrolled_date_time = Column(DateTime)
     last_sync_date_time = Column(DateTime, index=True)
     user_principal_name = Column(String, index=True)
@@ -48,7 +49,7 @@ class Device(Base):
     jail_broken = Column(String)
     encrypted = Column(Boolean)
     managed_device_owner_type = Column(String)
-    raw_json = Column(Text)  # original Graph payload
+    raw_json = Column(Text)
     synced_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
 
@@ -66,18 +67,18 @@ class Control(Base):
     """Unified entity: any Intune object that applies settings/state to devices."""
     __tablename__ = "controls"
 
-    id = Column(String, primary_key=True)  # Graph object id
+    id = Column(String, primary_key=True)
     display_name = Column(String, index=True)
-    control_type = Column(String, index=True)  # compliance_policy / config_policy / endpoint_security / app / script
-    platform = Column(String)  # windows10, iOS, android, ...
+    control_type = Column(String, index=True)
+    platform = Column(String)
     description = Column(Text)
-    last_modified_datetime = Column(DateTime, index=True)
     created_datetime = Column(DateTime)
+    last_modified_datetime = Column(DateTime)
     version = Column(String)
     is_assigned = Column(Boolean, default=False)
     assignment_count = Column(Integer, default=0)
+    api_source = Column(String)
     raw_json = Column(Text)
-    api_source = Column(String)  # v1.0 or beta
     synced_at = Column(DateTime, default=func.now())
 
     assignments = relationship("Assignment", back_populates="control", cascade="all, delete-orphan")
@@ -88,27 +89,27 @@ class Control(Base):
 
 
 # ---------------------------------------------------------------------------
-# Assignment (Control → Target)
+# Assignment
 # ---------------------------------------------------------------------------
 class Assignment(Base):
-    """Binding between a Control and a target (group/user/device/all)."""
+    """Represents a Graph assignment: control → group/allDevices."""
     __tablename__ = "assignments"
 
     id = Column(String, primary_key=True)
     control_id = Column(String, ForeignKey("controls.id", ondelete="CASCADE"), index=True)
-    target_type = Column(String)  # group / allDevices / allUsers / configManagerCollection
-    target_id = Column(String, index=True)  # group id or special value
+    target_type = Column(String)        # group / allDevices / allUsers / configManagerCollection
+    target_id = Column(String, index=True)
     target_display_name = Column(String)
-    intent = Column(String)  # include / exclude
+    intent = Column(String, default="include")  # include / exclude
     filter_id = Column(String)
-    filter_type = Column(String)  # include / exclude
+    filter_type = Column(String)
     raw_json = Column(Text)
     synced_at = Column(DateTime, default=func.now())
 
     control = relationship("Control", back_populates="assignments")
 
     __table_args__ = (
-        Index("ix_assignment_target", "target_type", "target_id"),
+        Index("ix_assignment_control_target", "control_id", "target_id"),
     )
 
 
@@ -116,25 +117,26 @@ class Assignment(Base):
 # Group
 # ---------------------------------------------------------------------------
 class Group(Base):
-    """Entra ID group referenced in assignments."""
+    """Entra ID group."""
     __tablename__ = "groups"
 
     id = Column(String, primary_key=True)
     display_name = Column(String, index=True)
     description = Column(Text)
-    group_types = Column(String)  # JSON array as string
+    group_types = Column(String)
     mail = Column(String)
-    member_count = Column(Integer)  # may be None if not fetched
-    is_dynamic = Column(Boolean, default=False)
-    synced_at = Column(DateTime, default=func.now())
+    membership_rule = Column(Text)
+    membership_rule_processing_state = Column(String)
+    member_count = Column(Integer)
     raw_json = Column(Text)
+    synced_at = Column(DateTime, default=func.now())
 
 
 # ---------------------------------------------------------------------------
-# Device → Group membership (local cache)
+# DeviceGroupMembership
 # ---------------------------------------------------------------------------
 class DeviceGroupMembership(Base):
-    """Cached mapping of device → entra group memberships."""
+    """Many-to-many: device ↔ group."""
     __tablename__ = "device_group_memberships"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -156,7 +158,7 @@ class App(Base):
 
     id = Column(String, primary_key=True)
     display_name = Column(String, index=True)
-    app_type = Column(String)  # winGet, msiApp, iosStoreApp, ...
+    app_type = Column(String)
     publisher = Column(String)
     description = Column(Text)
     version = Column(String)
@@ -178,7 +180,7 @@ class DeviceAppStatus(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
     app_id = Column(String, ForeignKey("apps.id", ondelete="CASCADE"), index=True)
-    install_state = Column(String)  # installed/failed/notInstalled/uninstallFailed/pendingInstall/unknown
+    install_state = Column(String)
     error_code = Column(Integer)
     last_sync_date_time = Column(DateTime)
     device_name = Column(String)
@@ -192,32 +194,6 @@ class DeviceAppStatus(Base):
     __table_args__ = (
         Index("ix_device_app", "device_id", "app_id"),
     )
-
-
-# ---------------------------------------------------------------------------
-# Remediation (Proactive Remediation / Device Health Script)
-# ---------------------------------------------------------------------------
-class Remediation(Base):
-    """
-    Intune Proactive Remediation (deviceHealthScript).
-    Requires: DeviceManagementConfiguration.Read.All (list/read)
-              DeviceManagementConfiguration.ReadWrite.All (run on-demand)
-    """
-    __tablename__ = "remediations"
-
-    id = Column(String, primary_key=True)           # Graph deviceHealthScript id
-    display_name = Column(String, index=True)
-    description = Column(Text)
-    publisher = Column(String)
-    is_global_script = Column(Boolean, default=False)  # Microsoft-managed script
-    highest_available_version = Column(String)
-    last_modified_datetime = Column(DateTime, index=True)
-    created_datetime = Column(DateTime)
-    raw_json = Column(Text)
-    synced_at = Column(DateTime, default=func.now())
-
-    def __repr__(self):
-        return f"<Remediation {self.display_name}>"
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +220,7 @@ class SnapshotItem(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     snapshot_id = Column(Integer, ForeignKey("snapshots.id", ondelete="CASCADE"), index=True)
-    entity_type = Column(String)   # device / control / assignment
+    entity_type = Column(String)
     entity_id = Column(String, index=True)
     display_name = Column(String)
     raw_json = Column(Text)
@@ -263,7 +239,7 @@ class DeviceComplianceStatus(Base):
     device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
     policy_id = Column(String, index=True)
     policy_display_name = Column(String)
-    status = Column(String)  # compliant / noncompliant / error / conflict / ...
+    status = Column(String)
     last_report_datetime = Column(DateTime)
     user_name = Column(String)
     user_principal_name = Column(String)
@@ -277,20 +253,17 @@ class DeviceComplianceStatus(Base):
 # Outcome (Explainability engine)
 # ---------------------------------------------------------------------------
 class Outcome(Base):
-    """
-    Observed or inferred state of a Control applied to a Device.
-    reason_code is an internal reason enum.
-    """
+    """Observed or inferred state of a Control applied to a Device."""
     __tablename__ = "outcomes"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     control_id = Column(String, ForeignKey("controls.id", ondelete="CASCADE"), index=True)
     device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
-    status = Column(String)  # success/error/conflict/notApplicable/unknown/compliant/nonCompliant
-    reason_code = Column(String)  # TARGETING_MISS / REQUIREMENT_NOT_MET / CONFLICT_SETTING / etc.
+    status = Column(String)
+    reason_code = Column(String)
     reason_detail = Column(Text)
     error_code = Column(String)
-    source = Column(String)  # graph_direct / heuristic / inferred
+    source = Column(String)
     raw_json = Column(Text)
     synced_at = Column(DateTime, default=func.now())
 
@@ -301,9 +274,6 @@ class Outcome(Base):
     )
 
 
-# ---------------------------------------------------------------------------
-# SyncLog
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # DriftReport
 # ---------------------------------------------------------------------------
@@ -318,7 +288,7 @@ class DriftReport(Base):
     added_count = Column(Integer, default=0)
     removed_count = Column(Integer, default=0)
     modified_count = Column(Integer, default=0)
-    report_json = Column(Text)  # full diff as JSON
+    report_json = Column(Text)
 
     def __repr__(self):
         return f"<DriftReport baseline={self.baseline_snapshot_id} current={self.current_snapshot_id}>"
@@ -334,9 +304,10 @@ class SyncLog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     started_at = Column(DateTime, default=func.now())
     finished_at = Column(DateTime)
-    status = Column(String)          # success / failed / partial
+    status = Column(String)
     devices_synced = Column(Integer, default=0)
     controls_synced = Column(Integer, default=0)
     apps_synced = Column(Integer, default=0)
     error_message = Column(Text)
     details_json = Column(Text)
+    details = Column(Text)

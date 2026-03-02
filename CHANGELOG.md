@@ -10,88 +10,90 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.1] — 2026-03-03
+
+### Removed
+- **Proactive Remediations feature** removed entirely pending redesign.
+  Deleted files: `app/collector/remediations.py`, `app/ui/pages/remediations_page.py`.
+  Removed from: sidebar nav, `__init__.py`, sync pipeline, `Remediation` DB model,
+  endpoint constants, `remediation_url()` / `open_remediation_portal()` helpers.
+- **`DeviceManagementConfiguration` scopes** (`Read.All`, `ReadWrite.All`) removed
+  from `DEFAULT_SCOPES` — no longer required without the Remediations feature.
+
+### Changed
+- `database.py` migration now drops the orphaned `remediations` table automatically
+  on first startup after upgrade (no manual action needed).
+
+---
+
+## [1.2.0] — 2026-03-02
+
+### Added
+- **DPAPI-encrypted token cache** via msal-extensions (Windows). Cache stored at
+  `%APPDATA%\IntuneDashboard\msal_cache.bin` — encrypted and bound to the Windows
+  user account. Falls back to plain SerializableTokenCache if msal-extensions is
+  not installed.
+- **Sign out / Clear Token Cache** button renamed and improved. `sign_out()` now
+  removes MSAL accounts, deletes cache files, and resets the singleton.
+- **Copy Code button** in device code dialog — copies the sign-in code to the
+  clipboard with one click.
+- **Admin Consent URL** helper (`admin_consent_url()`, `open_admin_consent_page()`)
+  and corresponding button in Settings.
+- **`AdminConsentRequiredError`** exception raised on AADSTS65001 / consent_required
+  errors, with a clear message directing the admin to grant consent.
+- **`cache_type()`** method on `MSALAuth` returns `'DPAPI'` or `'plain'`; shown in
+  Test Connection result.
+
+### Fixed
+- **Repeated device code flow** on ReadWrite.All vs Read.All scope split.
+  `_has_required_scopes()` now treats a granted `ReadWrite.All` as satisfying a
+  `Read.All` requirement, preventing unnecessary re-authentication.
+- **Legacy plain-text cache migration** — if DPAPI is available and the existing
+  cache file is plain JSON, it is deleted and the user re-authenticates once with
+  the encrypted store.
+
+---
+
 ## [1.1.1] — 2026-03-02
 
 ### Fixed
 - **Device code dialog missing on "Test Graph Connection"**: the button was silently
-  returning a cached token without showing the sign-in prompt. Fixed by explicitly
-  clearing the token cache before starting the `AuthWorker`, so the device code
-  dialog always appears when the user clicks the button.
-- **Remediations 403 — automatic re-authentication**: `auth.py` now compares the
-  scopes present in the cached token against `DEFAULT_SCOPES`. If the cached token
-  is missing a required scope (e.g. `DeviceManagementConfiguration.ReadWrite.All`
-  added in v1.1.0), the cache is cleared automatically and the device code flow is
-  triggered on the next sync or Test Connection — no manual "Clear Token Cache" step
-  required.
-- **Scope tracking first-run bug**: on the first run after replacing `auth.py`, the
-  `msal_scopes.json` file did not exist yet. The previous code wrote the new scope
-  hash without clearing the cache, leaving a stale token in place. Fixed: on first
-  run the cache is now cleared unconditionally so a fresh consent is obtained.
+  returning a cached token without showing the sign-in prompt.
+- **Scope tracking first-run bug**: `msal_scopes.json` not present on first run
+  caused the cache to remain stale instead of being cleared.
 - **`app/db/database.py` migration**: `outcomes` table is dropped and recreated if
-  the v1.0.0 schema (`applies`, `computed_at` columns) is detected, preventing the
-  `no such column: outcomes.status` error on existing databases.
-- **`DriftReport` model missing**: the class was accidentally omitted from the
-  delivered `models.py`, causing `ImportError` in `queries.py` and `governance_page`.
+  the v1.0.0 schema is detected (missing `status` column).
+- **`DriftReport` model missing** from `models.py`; restored.
 
 ---
 
 ## [1.1.0] — 2026-03-02
 
 ### Added
-- **Remediations page** — lists all Proactive Remediation scripts (deviceHealthScripts)
-  with name, publisher, type (Custom / Microsoft), last-modified date, and description.
-  Right-click context menu: Open in Portal, Run on Device, Copy, Export.
-- **Run Remediation on Device** — dialog to pick a target device and trigger an on-demand
-  run via Graph `POST .../initiateOnDemandProactiveRemediation`. Graceful error
-  messages for 403 (permission), 404 (not found), and Microsoft-managed (global) scripts.
-- **Centralised portal URL builder** (`app/utils/intune_links.py`) — single source of truth
-  for all Intune / Entra deep-links. Pure builder functions are fully unit-testable.
-- **Scope change detection** in `auth.py` — when `DEFAULT_SCOPES` changes between
-  versions (e.g. a new permission is added), the MSAL token cache is cleared
-  automatically on next startup and the user is prompted to re-authenticate with
-  the updated permission set. No manual cache clearing required.
-- **Device code dialog** restored in Settings → "Test Graph Connection":
-  a modal dialog displays the URL and the sign-in code while waiting for authentication.
-  The dialog closes automatically when sign-in completes.
-- **Unit tests** (`tests/test_intune_links.py`) — 50 test cases for all URL builders.
-  Self-contained runner: `python tests/test_intune_links.py`.
-- **Credential masking** in Settings — Tenant ID and Client ID are hidden by default;
-  a toggle button (👁) reveals the value.
-- `app/version.py` — single source of truth for `__version__ = "1.1.0"` and `APP_NAME`.
-- `DeviceManagementConfiguration.ReadWrite.All` added to `DEFAULT_SCOPES` (required
-  for the Remediations "Run on Device" action).
+- **Centralised portal URL builder** (`app/utils/intune_links.py`).
+- **Scope change detection** in `auth.py`.
+- **Device code dialog** in Settings → Test Graph Connection.
+- **Unit tests** (`tests/test_intune_links.py`) — 50 test cases.
+- **Credential masking** in Settings (👁 toggle).
+- `app/version.py` — single source of truth for version and app name.
 - `GraphClient.post()` method for write operations.
-- **DB migration** in `database.py` (`_migrate_db`) — automatically migrates existing
-  databases on startup:
-  - `outcomes` table: dropped and recreated if the v1.0 schema is detected
-    (missing `status` column). Data is fully derived and rebuilt on next sync.
-  - Additive `ALTER TABLE` migrations for other tables (non-destructive).
+- **DB migration** in `database.py` (`_migrate_db`).
 
 ### Fixed
-- **Device code dialog** was no longer appearing in Settings after the settings page
-  rewrite; restored `AuthWorker`-based flow with proper modal dialog.
-- **Compliance policy portal URLs** now open `CompliancePolicyOverview.ReactView`
-  (`Microsoft_Intune_DeviceSettings` namespace) with numeric `platform~` enum and
-  `policyType~/35`. Previously used `PolicySummaryBlade` → 404 in portal.
-- **Windows/macOS Update config policy URLs** now open
-  `SoftwareUpdatesConfigurationSummaryReportBlade` with correct type and journey params.
-- **App portal URLs** now use `SettingsMenu/~/0` instead of `AppOverview.ReactView` (404).
-- **Generic config policy fallback** uses `DeviceConfigurationMenuBlade` — never falls
-  through to `PolicySummaryBlade` for unclassified config profiles.
-- **`outcomes` table schema** — v1.0 schema had `applies` (bool) / `computed_at` instead
-  of `status` / `source` / `error_code` / `raw_json` / `synced_at`. Fixed in `models.py`
-  and automatically migrated by `database.py`.
-- **`DriftReport` model** missing from delivered `models.py`; restored.
+- Compliance policy portal URLs.
+- Windows/macOS Update config policy URLs.
+- App portal URLs (`SettingsMenu/~/0`).
+- Generic config policy fallback (`DeviceConfigurationMenuBlade`).
 
 ### Changed
-- Window title: removed `[read-only]` — title is now `Intune Dashboard 1.1.0`.
-- README fully rewritten in English with updated permissions table.
-- Remediations sync step added to pipeline (after apps, before assignments).
+- Window title updated to include version.
+- README rewritten in English.
 
 ---
 
 ## [1.0.0] — 2026-02-28
 
 ### Added
-- Initial release: Device Explorer, Policy Explorer, App Ops, Governance, Explainability,
-  Group Usage, Graph Query Lab, context menus, export, demo mode, per-subsystem logging.
+- Initial release: Device Explorer, Policy Explorer, App Ops, Governance,
+  Explainability, Group Usage, Graph Query Lab, context menus, export,
+  demo mode, per-subsystem logging.

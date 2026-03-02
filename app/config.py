@@ -1,5 +1,6 @@
 """
 Application configuration - paths, defaults, and persistent settings.
+app/config.py  —  v1.2.1
 """
 
 import os
@@ -13,27 +14,27 @@ logger = logging.getLogger(__name__)
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "IntuneDashboard"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = APP_DIR / "intune_dashboard.db"
-LOGS_DIR = APP_DIR / "logs"
+DB_PATH         = APP_DIR / "intune_dashboard.db"
+LOGS_DIR        = APP_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-EXPORT_DIR = APP_DIR / "exports"
+EXPORT_DIR      = APP_DIR / "exports"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 MSAL_CACHE_PATH = APP_DIR / "msal_cache.bin"
-CONFIG_PATH = APP_DIR / "config.json"
+CONFIG_PATH     = APP_DIR / "config.json"
 
 GRAPH_BASE_URL_V1   = "https://graph.microsoft.com/v1.0"
 GRAPH_BASE_URL_BETA = "https://graph.microsoft.com/beta"
 
+# Canonical scope list — one definition used everywhere.
+# DeviceManagementConfiguration scopes removed in v1.2.1
+# (Proactive Remediations feature removed).
 DEFAULT_SCOPES = [
     "https://graph.microsoft.com/DeviceManagementManagedDevices.Read.All",
-    "https://graph.microsoft.com/DeviceManagementConfiguration.Read.All",
     "https://graph.microsoft.com/DeviceManagementApps.Read.All",
     "https://graph.microsoft.com/Group.Read.All",
     "https://graph.microsoft.com/User.Read.All",
     "https://graph.microsoft.com/Device.Read.All",
     "https://graph.microsoft.com/DeviceManagementRBAC.Read.All",
-    # Required for Remediations "Run on Device" action
-    "https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All",
 ]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -80,45 +81,16 @@ class AppConfig:
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
 
+    def reload(self):
+        self._load()
+
     def get(self, key: str, default=None):
         return self._data.get(key, default)
 
     def set(self, key: str, value):
         self._data[key] = value
-        self.save()
 
-    def update(self, d: Dict[str, Any]):
-        self._data.update(d)
-        self.save()
-
-    @property
-    def tenant_id(self) -> str:
-        return self._data.get("tenant_id", "")
-
-    @property
-    def client_id(self) -> str:
-        return self._data.get("client_id", "")
-
-    @property
-    def auth_mode(self) -> str:
-        return self._data.get("auth_mode", "device_code")
-
-    @property
-    def db_path(self) -> str:
-        return self._data.get("db_path", str(DB_PATH))
-
-    @property
-    def export_dir(self) -> str:
-        return self._data.get("export_dir", str(EXPORT_DIR))
-
-    @property
-    def demo_mode(self) -> bool:
-        return self._data.get("demo_mode", False)
-
-    @property
-    def sync_interval_minutes(self) -> int:
-        return self._data.get("sync_interval_minutes", 60)
-
-    @property
-    def sync_enabled(self) -> bool:
-        return self._data.get("sync_enabled", True)
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._data.get(name, DEFAULT_CONFIG.get(name))

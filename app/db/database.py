@@ -7,8 +7,9 @@ been restructured across versions and performs the minimum ALTER/DROP+CREATE
 needed to bring the existing DB up to date without losing data.
 
 Tables that are safe to drop+recreate (fully derived from Graph data):
-  - outcomes      (rebuilt by compliance_status collector on every sync)
-  - remediations  (rebuilt by remediations collector on every sync)
+  - outcomes  (rebuilt by compliance_status collector on every sync)
+
+v1.2.1: Removed remediations table reference.
 """
 
 import logging
@@ -45,7 +46,6 @@ def init_db(db_path: str | None = None):
         echo=False,
     )
 
-    # Enable WAL mode and foreign keys
     @event.listens_for(_engine, "connect")
     def set_sqlite_pragma(dbapi_conn, connection_record):
         cursor = dbapi_conn.cursor()
@@ -54,7 +54,6 @@ def init_db(db_path: str | None = None):
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
 
-    # Migrate schema before create_all so old tables are fixed first
     _migrate_db(_engine)
 
     Base.metadata.create_all(_engine)
@@ -80,42 +79,40 @@ def _migrate_db(engine) -> None:
 
     Strategy per table:
       - outcomes:     derived data → drop and recreate if schema is outdated
-      - remediations: new table → create_all handles it; no migration needed
+      - remediations: orphaned table from v1.1.x — drop silently if present
       - drift_reports: new table → create_all handles it; no migration needed
     """
     with engine.begin() as conn:
 
         # ── outcomes ────────────────────────────────────────────────────────
-        # v1.0.0 schema: id, device_id, control_id, applies (bool), reason_code,
-        #                reason_detail, computed_at
-        # v1.1.0 schema: id, control_id, device_id, status (str), reason_code,
-        #                reason_detail, error_code, source, raw_json, synced_at
-        #
-        # 'outcomes' is fully derived — safe to drop+recreate.
         cols = _get_columns(engine, "outcomes")
         if cols and "status" not in cols:
             logger.warning(
                 "outcomes table has outdated schema (missing 'status' column). "
                 "Dropping and recreating — all data will be rebuilt on next sync."
             )
-            # Disable FK constraints temporarily so the drop succeeds
             conn.execute(text("PRAGMA foreign_keys=OFF"))
             conn.execute(text("DROP TABLE IF EXISTS outcomes"))
             conn.execute(text("PRAGMA foreign_keys=ON"))
             logger.info("outcomes table dropped — will be recreated by create_all()")
 
-        # ── Add missing columns to existing tables (non-destructive) ────────
-        # These are additive changes that don't require recreating the table.
+        # ── remediations ────────────────────────────────────────────────────
+        # Feature removed in v1.2.1 — drop the orphaned table if it exists.
+        insp = inspect(engine)
+        if "remediations" in insp.get_table_names():
+            conn.execute(text("PRAGMA foreign_keys=OFF"))
+            conn.execute(text("DROP TABLE IF EXISTS remediations"))
+            conn.execute(text("PRAGMA foreign_keys=ON"))
+            logger.info("remediations table dropped (feature removed in v1.2.1)")
 
-        # device_compliance_status: add user_principal_name if missing (v1.0 → v1.1)
+        # ── Add missing columns (non-destructive) ───────────────────────────
         _add_column_if_missing(conn, "device_compliance_status", "user_principal_name", "TEXT")
-
-        # controls: add api_source if missing
         _add_column_if_missing(conn, "controls", "api_source", "TEXT")
         _add_column_if_missing(conn, "controls", "is_assigned", "INTEGER DEFAULT 0")
-
-        # devices: add azure_ad_device_id if missing
+        _add_column_if_missing(conn, "controls", "assignment_count", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "devices", "azure_ad_device_id", "TEXT")
+        _add_column_if_missing(conn, "assignments", "raw_json", "TEXT")
+        _add_column_if_missing(conn, "assignments", "target_display_name", "TEXT")
 
     logger.info("Database migration check complete")
 

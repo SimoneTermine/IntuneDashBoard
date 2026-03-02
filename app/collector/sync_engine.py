@@ -3,16 +3,17 @@ app/collector/sync_engine.py
 
 Sync Engine — orchestrates all collectors and manages sync lifecycle.
 
-Pipeline (v1.1.0):
+Pipeline (v1.2.1):
   1. devices           - device metadata + overall compliance state
-  2. compliance_status - per-device per-policy compliance (device-first)
+  2. compliance_status - per-device per-policy compliance
   3. compliance_policies
   4. config_policies   - config + settings catalog + endpoint security
   5. apps              - app metadata + install status
-  6. remediations      - proactive remediation scripts (deviceHealthScripts) [NEW]
-  7. assignments       - control → group/allDevices assignments
-  8. groups            - group metadata
-  9. memberships       - user/device → group memberships
+  6. assignments       - control → group/allDevices assignments
+  7. groups            - group metadata
+  8. memberships       - user/device → group memberships
+
+Note: Proactive Remediations removed in v1.2.1.
 """
 
 import json
@@ -72,7 +73,8 @@ class SyncEngine:
             if elapsed is not None and elapsed < MIN_SYNC_INTERVAL_SECONDS:
                 remaining = int(MIN_SYNC_INTERVAL_SECONDS - elapsed)
                 raise RuntimeError(
-                    f"Sync cooldown active — last sync {int(elapsed)}s ago. Wait {remaining}s."
+                    f"Sync cooldown active — last sync {int(elapsed)}s ago. "
+                    f"Wait {remaining}s."
                 )
 
         self._running = True
@@ -91,7 +93,6 @@ class SyncEngine:
                 "compliance_policies",
                 "config_policies",
                 "apps",
-                "remediations",
                 "assignments",
                 "groups",
                 "memberships",
@@ -142,9 +143,6 @@ class SyncEngine:
         elif component == "apps":
             from app.collector.apps import AppCollector
             return AppCollector(client).sync_apps()
-        elif component == "remediations":
-            from app.collector.remediations import RemediationCollector
-            return RemediationCollector(client).sync_remediations()
         elif component == "assignments":
             from app.collector.policies import PolicyCollector
             return PolicyCollector(client).sync_all_assignments()
@@ -163,7 +161,7 @@ class SyncEngine:
         from app.demo.demo_data import load_demo_data
         self._emit("demo", 10, "Loading demo data...")
         time.sleep(0.3)
-        self._emit("demo", 60, "Inserting demo devices, policies, apps, remediations...")
+        self._emit("demo", 60, "Inserting demo devices, policies, apps...")
         count = load_demo_data()
         self._emit("demo", 100, f"Demo data loaded: {count} objects")
         SyncEngine._last_sync_time = datetime.utcnow()
@@ -191,6 +189,7 @@ class SyncEngine:
                 log.finished_at = datetime.utcnow()
                 log.status = status
                 log.error_message = error_message
+                log.details = json.dumps(results)
                 log.details_json = json.dumps(results)
                 log.devices_synced = results.get("devices", {}).get("count", 0)
                 log.controls_synced = (
@@ -199,8 +198,15 @@ class SyncEngine:
                 )
                 log.apps_synced = results.get("apps", {}).get("count", 0)
                 db.flush()
+                # Expunge before session closes so the object can be returned
+                db.expunge(log)
+                return log
         return sync_log
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler
+# ─────────────────────────────────────────────────────────────────────────────
 
 _scheduler = None
 

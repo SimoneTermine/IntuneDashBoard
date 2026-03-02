@@ -13,7 +13,6 @@ and provides a rich UI for device management, policy exploration, and governance
 | **Overview** | KPI cards, compliance charts, recent sync log |
 | **Device Explorer** | Search, filter, sort devices; right-click context menu |
 | **Policy Explorer** | Compliance, config, Settings Catalog, Endpoint Security, apps |
-| **Remediations** | Proactive Remediation scripts — list, inspect, run on-demand |
 | **App Ops** | Deployment state, top failures, install error clustering |
 | **Governance** | Point-in-time snapshots, drift detection between snapshots |
 | **Explainability** | Full reasoning chain: why a policy applies to a device |
@@ -26,7 +25,7 @@ and provides a rich UI for device management, policy exploration, and governance
 ## Requirements
 
 - Python **3.10+**
-- PySide6, msal, sqlalchemy, requests, apscheduler
+- PySide6, msal, msal-extensions, sqlalchemy, requests, apscheduler
 
 ```bash
 pip install -r requirements.txt
@@ -42,8 +41,6 @@ pip install -r requirements.txt
 | Permission | Required for |
 |---|---|
 | `DeviceManagementManagedDevices.Read.All` | Devices, compliance, force sync |
-| `DeviceManagementConfiguration.Read.All` | Policies, remediations (list/read) |
-| `DeviceManagementConfiguration.ReadWrite.All` | **Run Remediation on-demand** (write) |
 | `DeviceManagementApps.Read.All` | Apps, install status |
 | `Group.Read.All` | Group targeting, dead-assignment detection |
 | `User.Read.All` | User memberships, device–user correlation |
@@ -55,10 +52,6 @@ pip install -r requirements.txt
    Enable redirect URI: `https://login.microsoftonline.com/common/oauth2/nativeclient`
 5. **Advanced settings → Allow public client flows → Yes**
 
-> **Note on `ReadWrite.All` vs `Read.All`**: Adding `ReadWrite.All` implicitly covers
-> `Read.All` — you do not need to add both. The write permission is only exercised
-> when you explicitly click "Run on Device" in the Remediations page.
-
 ---
 
 ## Quick Start
@@ -69,7 +62,6 @@ cd intune-dashboard
 
 python -m venv .venv
 .venv\Scripts\activate        # Windows
-# or: source .venv/bin/activate  # macOS / Linux
 
 pip install -r requirements.txt
 python main.py
@@ -86,22 +78,34 @@ python main.py
 6. The dialog closes automatically once authentication succeeds
 7. Click **Sync Now** in the sidebar
 
+---
+
+## Authentication & Token Cache
+
+- **Cache location**: `%APPDATA%\IntuneDashboard\msal_cache.bin`
+- **Encryption**: DPAPI via msal-extensions (Windows, bound to your user account).
+  Falls back to plain JSON if msal-extensions is not installed.
+- **Sign out**: Settings → 🚪 Sign out / Clear Token Cache
+
 ### Automatic scope re-authentication
 
-When new Graph API permissions are added to the app (e.g. after an update),
-the token cache is **automatically cleared on next startup** and you will be
-prompted to sign in again with the updated permission set.
-No manual action required beyond completing the sign-in flow.
+When `DEFAULT_SCOPES` changes between versions, the token cache is automatically
+cleared on next startup and you will be prompted to sign in once with the updated
+permission set. No manual action required.
 
-### Demo Mode
+### Admin consent
 
-Enable in Settings to load synthetic data without credentials.
+If you see a 403 error or AADSTS65001, a Global Administrator must grant consent:
+
+1. Settings → **🔑 Open Admin Consent Page**
+2. Sign in as a Global Administrator and click Accept
+3. Settings → Sign out / Clear Token Cache → re-sync
 
 ---
 
 ## Portal Deep-links
 
-All "Open in Intune Portal" context menu actions use the correct portal blade per policy type.
+All "Open in Intune Portal" context menu actions use the correct portal blade.
 URL construction is centralised in `app/utils/intune_links.py`.
 
 | Policy type | Blade |
@@ -111,49 +115,40 @@ URL construction is centralised in `app/utils/intune_links.py`.
 | Windows / macOS Update config | `SoftwareUpdatesConfigurationSummaryReportBlade` |
 | Classic config profile | `DeviceConfigurationMenuBlade` |
 | App | `SettingsMenu/~/0` |
-| Remediation script | `DeviceHealthScriptsMenuBlade/~/scriptdetails` |
 | Device | `DeviceSettingsMenuBlade/~/overview` |
 
 ---
 
 ## Database Migration
 
-The app automatically migrates existing databases on startup (`database.py/_migrate_db`):
+The app automatically migrates existing databases on startup:
 
-- **`outcomes` table**: if the v1.0 schema is detected (missing `status` column),
-  the table is dropped and recreated. `outcomes` is fully derived data — it is rebuilt
-  from scratch on the next sync.
-- **Other tables**: additive `ALTER TABLE` migrations add missing columns
-  non-destructively (no data loss).
+- **`outcomes` table**: dropped and recreated if the v1.0 schema is detected.
+- **`remediations` table**: dropped automatically on first startup after v1.2.1
+  upgrade (orphaned table from the removed Remediations feature).
+- **Other tables**: additive `ALTER TABLE` migrations (non-destructive).
 
-If you prefer to start fresh: delete `%APPDATA%\IntuneDashboard\intune_dashboard.db`
-and restart. A full sync will repopulate everything.
+To start fresh: delete `%APPDATA%\IntuneDashboard\intune_dashboard.db` and restart.
 
 ---
 
 ## Troubleshooting
 
-**Remediations page is empty after sync**
-
-The Remediations sync requires `DeviceManagementConfiguration.Read.All`.
-Verify admin consent has been granted in Entra for this permission,
-then clear the token cache (Settings → Clear Token Cache) and re-authenticate.
-
-**"Permission denied" when running a remediation**
-
-The "Run on Device" action requires `DeviceManagementConfiguration.ReadWrite.All`.
-Add this permission in Entra, re-grant admin consent. The app will detect the
-scope change automatically on next restart and prompt for re-authentication.
-
 **Device code dialog does not appear**
 
 Ensure `Auth Mode` is set to `device_code` in Settings. If the token cache is
-already valid, no dialog is needed. Use "Clear Token Cache" to force a new sign-in.
+already valid, no dialog is needed. Use "Sign out / Clear Token Cache" to force
+a new sign-in.
 
 **`no such column: outcomes.status` error**
 
-Your database was created with v1.0. Update `app/db/database.py` to v1.1.0 —
-the migration will drop and recreate `outcomes` automatically on next startup.
+Your database was created with v1.0. The migration runs automatically on startup —
+just restart the app.
+
+**403 error on sync**
+
+Verify all required permissions are granted with admin consent in Entra.
+Then: Settings → Sign out / Clear Token Cache → Sync Now.
 
 **Log files** — all logs in `%APPDATA%\IntuneDashboard\logs\`
 
@@ -170,25 +165,8 @@ the migration will drop and recreate `outcomes` automatically on next startup.
 
 ```bash
 python tests/test_intune_links.py      # self-contained, no pytest required
-python -m pytest tests/ -v             # with pytest
+python -m pytest tests/ -v
 ```
-
----
-
-## Authentication — How It Works
-
-### Test Graph Connection
-Clicking **Test Graph Connection** in Settings always triggers a full re-authentication:
-1. The existing token cache is cleared.
-2. The device code dialog appears with a URL and a short code.
-3. Open the URL in any browser, enter the code, and sign in with your admin account.
-4. The dialog closes automatically and the connection result is shown.
-
-### Automatic scope upgrade
-When `DEFAULT_SCOPES` changes between versions (e.g. `DeviceManagementConfiguration.ReadWrite.All`
-was added in v1.1.0 for Remediations), the app detects the mismatch on startup and clears
-the token cache. The next sync or Test Connection will prompt for a new sign-in that includes
-the updated permissions — no manual action required.
 
 ---
 

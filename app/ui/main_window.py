@@ -2,6 +2,7 @@
 Main application window.
 Sidebar navigation → StackedWidget pages.
 Global search bar, sync status, status bar.
+app/ui/main_window.py  —  v1.2.1 (Remediations removed)
 """
 
 import logging
@@ -9,8 +10,7 @@ import logging
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFrame, QPushButton, QLabel, QStackedWidget,
-    QLineEdit, QStatusBar, QSizePolicy, QScrollArea,
-    QSplitter, QMessageBox,
+    QLineEdit, QStatusBar, QSizePolicy, QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
@@ -18,7 +18,7 @@ from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from app.ui.pages import (
     OverviewPage, DeviceExplorerPage, DeviceDetailPage,
     PolicyExplorerPage, ExplainabilityPage, AppOpsPage,
-    GovernancePage, GroupUsagePage, RemediationsPage,
+    GovernancePage, GroupUsagePage,
     SettingsPage, GraphQueryPage,
 )
 from app.ui.widgets.sync_status_widget import SyncStatusWidget
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # Sidebar
+        # ── Sidebar ───────────────────────────────────────────────────────
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(220)
@@ -82,22 +82,21 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(logo)
 
         nav_entries = [
-            (None, "OVERVIEW",    None,              True),
-            ("📊", "Overview",    "overview",        False),
-            (None, "INVENTORY",   None,              True),
+            (None, "OVERVIEW",   None,             True),
+            ("📊", "Overview",   "overview",       False),
+            (None, "INVENTORY",  None,             True),
             ("🖥️", "Device Explorer",  "devices",       False),
             ("📋", "Device Detail",    "device_detail", False),
             ("📑", "Policy Explorer",  "policies",      False),
             ("👥", "Group Usage",      "group_usage",   False),
-            (None, "ANALYSIS",    None,              True),
+            (None, "ANALYSIS",   None,             True),
             ("🔍", "Explain State",    "explain",       False),
             ("📦", "App Ops",          "app_ops",       False),
-            ("💊", "Remediations",     "remediations",  False),
             ("🧪", "Graph Query Lab",  "graph_query",   False),
-            (None, "GOVERNANCE",  None,              True),
+            (None, "GOVERNANCE", None,             True),
             ("📈", "Drift & Snapshots", "governance",   False),
-            (None, "SETTINGS",    None,              True),
-            ("⚙️", "Settings",    "settings",        False),
+            (None, "SETTINGS",   None,             True),
+            ("⚙️", "Settings",   "settings",       False),
         ]
 
         self._nav_buttons: dict[str, SidebarButton] = {}
@@ -122,7 +121,7 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(sidebar)
 
-        # Content area
+        # ── Content area ──────────────────────────────────────────────────
         content_area = QWidget()
         content_layout = QVBoxLayout(content_area)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -150,50 +149,53 @@ class MainWindow(QMainWindow):
         demo_badge = QLabel()
         from app.config import AppConfig
         if AppConfig().demo_mode:
-            demo_badge.setText("⚡ DEMO MODE")
+            demo_badge.setText("  🎭 DEMO MODE  ")
             demo_badge.setStyleSheet(
-                "background: #f9e2af; color: #1e1e2e; padding: 3px 8px; "
-                "border-radius: 4px; font-weight: bold; font-size: 11px;"
+                "background: #f38ba8; color: #1e1e2e; font-weight: bold; "
+                "border-radius: 4px; padding: 2px 8px; font-size: 11px;"
             )
 
         toolbar_layout.addWidget(self._global_search)
         toolbar_layout.addWidget(search_btn)
         toolbar_layout.addStretch()
         toolbar_layout.addWidget(demo_badge)
+
         content_layout.addWidget(toolbar)
 
         self._stack = QStackedWidget()
-        self._pages: dict[str, QWidget] = {}
+        content_layout.addWidget(self._stack)
 
-        self._pages["overview"]      = OverviewPage()
-        self._pages["devices"]       = DeviceExplorerPage()
-        self._pages["device_detail"] = DeviceDetailPage()
-        self._pages["policies"]      = PolicyExplorerPage()
-        self._pages["group_usage"]   = GroupUsagePage()
-        self._pages["explain"]       = ExplainabilityPage()
-        self._pages["app_ops"]       = AppOpsPage()
-        self._pages["remediations"]  = RemediationsPage()
-        self._pages["graph_query"]   = GraphQueryPage()
-        self._pages["governance"]    = GovernancePage()
-        self._pages["settings"]      = SettingsPage()
+        self._status_bar = QStatusBar()
+        self._status_bar.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        self.setStatusBar(self._status_bar)
 
-        self._pages["devices"].device_selected.connect(self._on_device_selected)
+        root_layout.addWidget(content_area)
+
+        # ── Pages ─────────────────────────────────────────────────────────
+        self._pages: dict[str, QWidget] = {
+            "overview":      OverviewPage(),
+            "devices":       DeviceExplorerPage(),
+            "device_detail": DeviceDetailPage(),
+            "policies":      PolicyExplorerPage(),
+            "group_usage":   GroupUsagePage(),
+            "explain":       ExplainabilityPage(),
+            "app_ops":       AppOpsPage(),
+            "graph_query":   GraphQueryPage(),
+            "governance":    GovernancePage(),
+            "settings":      SettingsPage(),
+        }
 
         for page in self._pages.values():
             self._stack.addWidget(page)
 
-        content_layout.addWidget(self._stack)
-        root_layout.addWidget(content_area)
-
-        self._status_bar = QStatusBar()
-        self.setStatusBar(self._status_bar)
-        self._status_bar.showMessage("Ready")
+        if hasattr(self._pages["devices"], "device_selected"):
+            self._pages["devices"].device_selected.connect(self._on_device_selected)
 
         self._navigate("overview")
 
     def _setup_shortcuts(self):
-        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search)
-        QShortcut(QKeySequence("F5"), self, self._refresh_current)
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._focus_search)
+        QShortcut(QKeySequence("F5"), self).activated.connect(self._refresh_current)
 
     def _navigate(self, page_key: str):
         if page_key not in self._pages:

@@ -1,19 +1,28 @@
 """
-Settings page — tenant/auth config, scheduler, storage, privacy.
-Credentials fields (Tenant ID, Client ID) are masked by default with a show/hide toggle.
+Settings page — tenant/auth configuration, scheduler, storage, privacy.
+
+Changes in v1.2.0:
+  • Device code dialog: "Copy Code" button copies user_code to clipboard.
+  • Sign-out button renamed to "Sign out / Clear Token Cache".
+  • Admin consent section: "Open Admin Consent Page" button.
+  • 403 / AdminConsentRequiredError surfaces a dedicated warning with the
+    admin consent URL.
+  • Cache type (DPAPI / plain) shown in Connection Test result.
 """
 
 import logging
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QComboBox, QSpinBox, QCheckBox, QGroupBox,
-    QTextEdit, QFileDialog, QMessageBox, QTabWidget, QScrollArea,
-    QFrame, QDialog,
+    QPushButton, QTextEdit, QGroupBox, QCheckBox, QComboBox,
+    QSpinBox, QScrollArea, QFrame, QDialog, QFileDialog,
+    QMessageBox, QApplication,
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 
-from app.config import AppConfig
+from app.config import AppConfig, DEFAULT_SCOPES
+from app.graph.auth import AuthError, AdminConsentRequiredError
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +36,10 @@ class SettingsPage(QWidget):
         self._setup_ui()
         self._load_config()
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # UI construction
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _setup_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -34,27 +47,67 @@ class SettingsPage(QWidget):
 
         content = QWidget()
         main_layout = QVBoxLayout(content)
-        main_layout.setContentsMargins(24, 24, 24, 24)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
 
-        title = QLabel("Settings")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #cba6f7;")
+        title = QLabel("⚙️  Settings")
+        title.setFont(QFont("", 16, QFont.Bold))
         main_layout.addWidget(title)
 
+        from PySide6.QtWidgets import QTabWidget
         tabs = QTabWidget()
         main_layout.addWidget(tabs)
 
-        # ── Auth tab ────────────────────────────────────────────────────────
+        # ── Tenant / Auth tab ─────────────────────────────────────────────
         auth_widget = QWidget()
         auth_layout = QVBoxLayout(auth_widget)
         auth_layout.setContentsMargins(8, 8, 8, 8)
         auth_layout.setSpacing(12)
 
-        tenant_group = QGroupBox("Tenant & App Registration")
+        tenant_group = QGroupBox("Tenant / App Registration")
         tgl = QVBoxLayout(tenant_group)
-        self._tenant_id, _ = self._labeled_input_masked("Tenant ID (Directory ID):", tgl)
-        self._client_id, _ = self._labeled_input_masked("Client ID (Application ID):", tgl)
 
+        # Tenant ID (masked)
+        tid_row = QHBoxLayout()
+        tid_row.addWidget(QLabel("Tenant ID:"))
+        self._tenant_id = QLineEdit()
+        self._tenant_id.setEchoMode(QLineEdit.Password)
+        self._tenant_id.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        reveal_tid = QPushButton("👁")
+        reveal_tid.setMaximumWidth(32)
+        reveal_tid.setCheckable(True)
+        reveal_tid.toggled.connect(
+            lambda checked: self._tenant_id.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        )
+        tid_row.addWidget(self._tenant_id)
+        tid_row.addWidget(reveal_tid)
+        tgl.addLayout(tid_row)
+
+        # Client ID (masked)
+        cid_row = QHBoxLayout()
+        cid_row.addWidget(QLabel("Client (App) ID:"))
+        self._client_id = QLineEdit()
+        self._client_id.setEchoMode(QLineEdit.Password)
+        self._client_id.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        reveal_cid = QPushButton("👁")
+        reveal_cid.setMaximumWidth(32)
+        reveal_cid.setCheckable(True)
+        reveal_cid.toggled.connect(
+            lambda checked: self._client_id.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        )
+        cid_row.addWidget(self._client_id)
+        cid_row.addWidget(reveal_cid)
+        tgl.addLayout(cid_row)
+
+        auth_layout.addWidget(tenant_group)
+
+        # Auth mode
+        mode_group = QGroupBox("Authentication Mode")
+        mgl = QVBoxLayout(mode_group)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Auth Mode:"))
         self._auth_mode = QComboBox()
@@ -62,10 +115,11 @@ class SettingsPage(QWidget):
         self._auth_mode.currentTextChanged.connect(self._on_auth_mode_changed)
         mode_row.addWidget(self._auth_mode)
         mode_row.addStretch()
-        tgl.addLayout(mode_row)
-        auth_layout.addWidget(tenant_group)
+        mgl.addLayout(mode_row)
+        auth_layout.addWidget(mode_group)
 
-        self._cert_group = QGroupBox("Certificate (App-Only Mode)")
+        # Certificate (app-only)
+        self._cert_group = QGroupBox("App-Only Certificate")
         certgl = QVBoxLayout(self._cert_group)
         self._cert_thumbprint = self._labeled_input("Certificate Thumbprint:", certgl)
         cert_path_row = QHBoxLayout()
@@ -81,6 +135,7 @@ class SettingsPage(QWidget):
         self._cert_group.hide()
         auth_layout.addWidget(self._cert_group)
 
+        # Demo mode
         demo_group = QGroupBox("Demo Mode")
         dgl = QVBoxLayout(demo_group)
         self._demo_mode = QCheckBox(
@@ -96,35 +151,60 @@ class SettingsPage(QWidget):
         dgl.addWidget(demo_info)
         auth_layout.addWidget(demo_group)
 
+        # ── Connection Test ────────────────────────────────────────────────
         conn_group = QGroupBox("Connection Test")
         cgl = QVBoxLayout(conn_group)
+
         test_row = QHBoxLayout()
-        self._test_btn = QPushButton("Test Graph Connection")
+        self._test_btn = QPushButton("🔗  Test Graph Connection")
         self._test_btn.clicked.connect(self._test_connection)
-        self._logout_btn = QPushButton("Clear Token Cache (Logout)")
+
+        self._logout_btn = QPushButton("🚪  Sign out / Clear Token Cache")
         self._logout_btn.setObjectName("DangerButton")
         self._logout_btn.clicked.connect(self._logout)
+
         test_row.addWidget(self._test_btn)
         test_row.addWidget(self._logout_btn)
         test_row.addStretch()
         cgl.addLayout(test_row)
+
+        # Admin consent row
+        consent_row = QHBoxLayout()
+        self._consent_btn = QPushButton("🔑  Open Admin Consent Page")
+        self._consent_btn.setToolTip(
+            "Open the Azure AD admin consent page in your browser.\n"
+            "A Global Administrator must grant consent for all required permissions."
+        )
+        self._consent_btn.clicked.connect(self._open_admin_consent)
+        consent_row.addWidget(self._consent_btn)
+
+        consent_info = QLabel(
+            "Required if you see 403 / AADSTS65001 errors. "
+            "A tenant admin must visit this URL and click 'Accept'."
+        )
+        consent_info.setWordWrap(True)
+        consent_info.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        consent_row.addWidget(consent_info, 1)
+        cgl.addLayout(consent_row)
+
         self._test_result = QTextEdit()
         self._test_result.setReadOnly(True)
         self._test_result.setMaximumHeight(120)
-        self._test_result.setPlaceholderText("Test result appears here...")
+        self._test_result.setPlaceholderText("Test result appears here…")
         cgl.addWidget(self._test_result)
         auth_layout.addWidget(conn_group)
 
+        # Device code how-it-works
         dcode_group = QGroupBox("Device Code Flow — How It Works")
         dcode_gl = QVBoxLayout(dcode_group)
         instructions = QLabel(
             "1. Click 'Test Graph Connection' or 'Sync Now'.\n"
-            "2. A dialog will appear with a URL and a code.\n"
-            "3. Open the URL in any browser (same or different device).\n"
-            "4. Enter the code and sign in with your admin account.\n"
-            "5. The app receives the token automatically — the dialog closes.\n\n"
+            "2. A dialog appears with a URL and a sign-in code.\n"
+            "3. Use the 'Copy Code' button or select it manually.\n"
+            "4. Open the URL in any browser, enter the code, sign in.\n"
+            "5. The dialog closes automatically once authentication completes.\n\n"
             "The token is cached locally and refreshed automatically.\n"
-            "If new permissions are added, the cache is cleared and you will be\n"
+            "If new permissions are added, the cache is cleared and you are\n"
             "prompted to re-authenticate with the updated permission set."
         )
         instructions.setWordWrap(True)
@@ -135,7 +215,7 @@ class SettingsPage(QWidget):
         auth_layout.addStretch()
         tabs.addTab(auth_widget, "Tenant / Auth")
 
-        # ── Scheduler tab ───────────────────────────────────────────────────
+        # ── Scheduler tab ─────────────────────────────────────────────────
         sched_widget = QWidget()
         sched_layout = QVBoxLayout(sched_widget)
         sched_layout.setContentsMargins(8, 8, 8, 8)
@@ -163,7 +243,7 @@ class SettingsPage(QWidget):
         sched_layout.addStretch()
         tabs.addTab(sched_widget, "Scheduler")
 
-        # ── Storage tab ─────────────────────────────────────────────────────
+        # ── Storage tab ───────────────────────────────────────────────────
         storage_widget = QWidget()
         storage_layout = QVBoxLayout(storage_widget)
         storage_layout.setContentsMargins(8, 8, 8, 8)
@@ -189,7 +269,7 @@ class SettingsPage(QWidget):
         storage_layout.addStretch()
         tabs.addTab(storage_widget, "Storage")
 
-        # ── Privacy tab ──────────────────────────────────────────────────────
+        # ── Privacy tab ───────────────────────────────────────────────────
         privacy_widget = QWidget()
         priv_layout = QVBoxLayout(privacy_widget)
         priv_layout.setContentsMargins(8, 8, 8, 8)
@@ -200,9 +280,14 @@ class SettingsPage(QWidget):
             "<p>All data is stored locally on your machine. No data is sent to any "
             "third-party service other than Microsoft Graph API.</p>"
             "<ul>"
-            "<li>Device metadata, policy info, and app data are cached in a local SQLite DB.</li>"
-            "<li>Authentication tokens are stored using MSAL encrypted token cache.</li>"
-            "<li>Use the minimum required Graph API permissions (read-only where possible).</li>"
+            "<li>Device metadata, policy info, and app data are cached in a local "
+            "SQLite database.</li>"
+            "<li>The authentication token cache is stored at "
+            "<code>%APPDATA%\\IntuneDashboard\\msal_cache.bin</code> and is "
+            "<b>encrypted via Windows DPAPI</b> when msal-extensions is installed "
+            "(binding it to your Windows user account).</li>"
+            "<li>Token contents are never written to log files.</li>"
+            "<li>Use minimum required Graph API permissions (read-only where possible).</li>"
             "<li>Regularly rotate app credentials in Entra ID.</li>"
             "</ul>"
             "<p style='color:#6c7086;font-size:11px'>"
@@ -237,75 +322,42 @@ class SettingsPage(QWidget):
         parent_layout.addLayout(row)
         return inp
 
-    def _labeled_input_masked(self, label: str, parent_layout) -> tuple:
-        row = QHBoxLayout()
-        lbl = QLabel(label)
-        lbl.setMinimumWidth(200)
-        inp = QLineEdit()
-        inp.setEchoMode(QLineEdit.Password)
-        toggle_btn = QPushButton("👁")
-        toggle_btn.setMaximumWidth(36)
-        toggle_btn.setCheckable(True)
-        toggle_btn.setToolTip("Show / hide")
-        toggle_btn.setStyleSheet(
-            "QPushButton { border: 1px solid #45475a; border-radius: 4px; padding: 2px 4px; }"
-            "QPushButton:checked { background: #313244; }"
-        )
-        toggle_btn.toggled.connect(
-            lambda checked: inp.setEchoMode(
-                QLineEdit.Normal if checked else QLineEdit.Password
-            )
-        )
-        row.addWidget(lbl)
-        row.addWidget(inp)
-        row.addWidget(toggle_btn)
-        parent_layout.addLayout(row)
-        return inp, toggle_btn
-
     def _on_auth_mode_changed(self, mode: str):
         self._cert_group.setVisible(mode == "app_only")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Load / Save
+    # Config load / save
     # ─────────────────────────────────────────────────────────────────────────
 
     def _load_config(self):
         cfg = AppConfig()
-        self._tenant_id.setText(cfg.tenant_id)
-        self._client_id.setText(cfg.client_id)
-        self._auth_mode.setCurrentText(cfg.auth_mode)
-        self._cert_thumbprint.setText(cfg.get("cert_thumbprint", ""))
-        self._cert_path.setText(cfg.get("cert_path", ""))
-        self._demo_mode.setChecked(cfg.demo_mode)
+        self._tenant_id.setText(cfg.tenant_id or "")
+        self._client_id.setText(cfg.client_id or "")
+        mode = cfg.auth_mode or "device_code"
+        idx = self._auth_mode.findText(mode)
+        if idx >= 0:
+            self._auth_mode.setCurrentIndex(idx)
+        self._cert_thumbprint.setText(cfg.get("cert_thumbprint", "") or "")
+        self._cert_path.setText(cfg.get("cert_path", "") or "")
         self._sync_enabled.setChecked(cfg.sync_enabled)
-        self._sync_interval.setValue(cfg.sync_interval_minutes)
-        self._db_path.setText(cfg.db_path)
-        self._export_dir.setText(cfg.export_dir)
-        self._on_auth_mode_changed(cfg.auth_mode)
+        self._sync_interval.setValue(cfg.sync_interval_minutes or 60)
+        self._db_path.setText(cfg.db_path or "")
+        self._export_dir.setText(cfg.export_dir or "")
+        self._demo_mode.setChecked(cfg.demo_mode)
+        self._on_auth_mode_changed(mode)
 
     def _save_config(self):
         cfg = AppConfig()
-        cfg.update({
-            "tenant_id": self._tenant_id.text().strip(),
-            "client_id": self._client_id.text().strip(),
-            "auth_mode": self._auth_mode.currentText(),
-            "cert_thumbprint": self._cert_thumbprint.text().strip(),
-            "cert_path": self._cert_path.text().strip(),
-            "demo_mode": self._demo_mode.isChecked(),
-            "sync_enabled": self._sync_enabled.isChecked(),
-            "sync_interval_minutes": self._sync_interval.value(),
-            "export_dir": self._export_dir.text().strip(),
-        })
-        from app.graph.client import reset_client
-        from app.graph.auth import _auth_instance
-        import app.graph.auth as _auth_mod
-        _auth_mod._auth_instance = None  # force re-init with new tenant/client
-        reset_client()
-        QMessageBox.information(
-            self, "Saved",
-            "Settings saved.\n"
-            "Re-authenticate if you changed Tenant ID or Client ID."
-        )
+        cfg.set("tenant_id", self._tenant_id.text().strip())
+        cfg.set("client_id", self._client_id.text().strip())
+        cfg.set("auth_mode", self._auth_mode.currentText())
+        cfg.set("cert_thumbprint", self._cert_thumbprint.text().strip())
+        cfg.set("cert_path", self._cert_path.text().strip())
+        cfg.set("sync_enabled", self._sync_enabled.isChecked())
+        cfg.set("sync_interval_minutes", self._sync_interval.value())
+        cfg.set("export_dir", self._export_dir.text().strip())
+        cfg.set("demo_mode", self._demo_mode.isChecked())
+        cfg.save()
         logger.info("Settings saved")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -325,12 +377,11 @@ class SettingsPage(QWidget):
             )
             return
 
-        # Always clear the token cache so the device code dialog is shown every time.
-        # "Test Graph Connection" is an explicit re-authentication, not a silent check.
-        from app.graph.auth import get_auth
+        # Always clear the token cache so the device code dialog is shown.
+        # "Test Graph Connection" is an explicit re-authentication action.
         from app.graph import auth as _auth_mod
-        get_auth().clear_cache()
-        _auth_mod._auth_instance = None   # reset singleton so next get_auth() re-inits
+        _auth_mod.get_auth().clear_cache()
+        _auth_mod._auth_instance = None   # force singleton re-init
 
         cfg = AppConfig()
         self._test_btn.setEnabled(False)
@@ -340,10 +391,10 @@ class SettingsPage(QWidget):
             self._auth_worker = AuthWorker()
 
             def on_code(user_code: str, uri: str):
-                """Called from background thread — build dialog on main thread."""
+                """Show device code dialog — called from background thread via signal."""
                 dlg = QDialog(self)
                 dlg.setWindowTitle("Sign in to Microsoft")
-                dlg.setMinimumWidth(460)
+                dlg.setMinimumWidth(480)
                 dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
                 dl = QVBoxLayout(dlg)
                 dl.setSpacing(12)
@@ -380,9 +431,27 @@ class SettingsPage(QWidget):
                 code_lbl.setTextFormat(Qt.RichText)
                 dl.addWidget(code_lbl)
 
+                # ── Copy-to-clipboard button ──────────────────────────────
+                copy_row = QHBoxLayout()
+                copy_btn = QPushButton("📋  Copy Code")
+                copy_btn.setMinimumHeight(32)
+                copy_btn.setToolTip("Copy the sign-in code to the clipboard")
+
+                def _copy_code():
+                    QApplication.clipboard().setText(user_code)
+                    copy_btn.setText("✅  Copied!")
+                    copy_btn.setEnabled(False)
+
+                copy_btn.clicked.connect(_copy_code)
+                copy_row.addStretch()
+                copy_row.addWidget(copy_btn)
+                copy_row.addStretch()
+                dl.addLayout(copy_row)
+                # ─────────────────────────────────────────────────────────
+
                 waiting = QLabel(
-                    "Waiting for sign-in... "
-                    "This dialog will close automatically once authentication completes."
+                    "Waiting for sign-in… "
+                    "This dialog closes automatically once authentication completes."
                 )
                 waiting.setWordWrap(True)
                 waiting.setStyleSheet("color: #a6adc8; font-size: 11px;")
@@ -402,12 +471,19 @@ class SettingsPage(QWidget):
 
                 if success:
                     try:
+                        from app.graph.auth import get_auth
+                        cache_type = get_auth().cache_type()
                         client = get_client()
                         result = client.test_connection()
+                        status_icon = "✅" if result["ok"] else "❌"
                         self._test_result.setPlainText(
-                            f"✅ {result['details']}"
-                            if result["ok"]
-                            else f"❌ {result['details']}"
+                            f"{status_icon} {result['details']}\n"
+                            f"Token cache: {cache_type}"
+                        )
+                    except AdminConsentRequiredError as e:
+                        self._test_result.setPlainText(
+                            f"❌ Admin consent required.\n{e}\n\n"
+                            "Use the 'Open Admin Consent Page' button below."
                         )
                     except Exception as e:
                         self._test_result.setPlainText(f"❌ Error: {e}")
@@ -434,25 +510,74 @@ class SettingsPage(QWidget):
                 self._test_btn.setEnabled(True)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Other actions
+    # Sign out / Clear Token Cache
     # ─────────────────────────────────────────────────────────────────────────
 
     def _logout(self):
         reply = QMessageBox.question(
-            self, "Clear Token Cache",
-            "This will delete the cached authentication token.\n"
-            "You will need to sign in again on the next sync.\n\nContinue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            self,
+            "Sign out / Clear Token Cache",
+            "You will be signed out and the local token cache will be removed.\n\n"
+            "The next sync will require signing in again via device code.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
-        if reply == QMessageBox.Yes:
-            try:
-                from app.graph.auth import get_auth
-                get_auth().clear_cache()
-                from app.graph.client import reset_client
-                reset_client()
-                QMessageBox.information(self, "Logged Out", "Token cache cleared.")
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to clear cache: {e}")
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            from app.graph.auth import get_auth
+            from app.graph import auth as _auth_mod
+            from app.graph.client import reset_client
+
+            get_auth().sign_out()
+            _auth_mod._auth_instance = None   # force singleton re-init on next use
+            reset_client()
+
+            QMessageBox.information(
+                self,
+                "Signed out",
+                "You have been signed out.\n"
+                "Token cache removed.\n\n"
+                "The next sync will prompt for a new sign-in.",
+            )
+            self._test_result.setPlainText("Signed out — token cache cleared.")
+        except Exception as e:
+            QMessageBox.warning(self, "Sign-out Error", f"Failed to sign out:\n{e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Admin consent
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _open_admin_consent(self):
+        from app.graph.auth import open_admin_consent_page, admin_consent_url
+
+        cfg = AppConfig()
+        if not cfg.client_id:
+            QMessageBox.warning(
+                self,
+                "Client ID Missing",
+                "Please enter your Client (App) ID in the settings above and save "
+                "before opening the admin consent page.",
+            )
+            return
+
+        url = admin_consent_url(cfg.client_id, cfg.tenant_id or "common")
+        open_admin_consent_page(cfg.client_id, cfg.tenant_id or "common")
+        QMessageBox.information(
+            self,
+            "Admin Consent Page Opened",
+            f"The admin consent page has been opened in your browser.\n\n"
+            f"URL:\n{url}\n\n"
+            "A Global Administrator must sign in and click 'Accept' to grant "
+            "consent for all required permissions.\n\n"
+            "After consent is granted, click 'Test Graph Connection' or run a sync.",
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Other actions
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _browse_cert(self):
         path, _ = QFileDialog.getOpenFileName(
