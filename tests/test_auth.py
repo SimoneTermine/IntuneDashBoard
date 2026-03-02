@@ -65,3 +65,14 @@ def test_get_token_device_code_falls_back_to_device_code_when_consent_needed(mon
 
     assert token == "interactive-token"
     fake_app.initiate_device_flow.assert_called_once()
+
+
+def test_admin_consent_url_defaults_without_redirect_uri():
+    url = MSALAuth.build_admin_consent_url()
+    assert "adminconsent?client_id=" in url
+    assert "redirect_uri=" not in url
+
+
+def test_admin_consent_url_can_include_redirect_uri():
+    url = MSALAuth.build_admin_consent_url(include_redirect_uri=True)
+    assert "redirect_uri=" in url

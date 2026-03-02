@@ -419,7 +419,7 @@ class SettingsPage(QWidget):
                         if consent == QMessageBox.Yes:
                             from app.graph.auth import MSALAuth
 
-                            webbrowser.open(MSALAuth.build_admin_consent_url())
+                            webbrowser.open(MSALAuth.build_admin_consent_url(include_redirect_uri=False))
 
                 self._test_btn.setEnabled(True)
 
@@ -447,7 +447,7 @@ class SettingsPage(QWidget):
                     if consent == QMessageBox.Yes:
                         from app.graph.auth import MSALAuth
 
-                        webbrowser.open(MSALAuth.build_admin_consent_url())
+                        webbrowser.open(MSALAuth.build_admin_consent_url(include_redirect_uri=False))
             except Exception as e:
                 self._test_result.setPlainText(f"❌ Error: {e}")
             finally:

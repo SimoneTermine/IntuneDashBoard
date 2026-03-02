@@ -15,7 +15,6 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Callable
-from urllib.parse import quote
 
 import msal
 
@@ -141,20 +140,29 @@ class MSALAuth:
         return True
 
     @staticmethod
-    def build_admin_consent_url() -> str:
+    def build_admin_consent_url(include_redirect_uri: bool = False) -> str:
+        """
+        Build admin consent URL.
+
+        NOTE: many tenants/app registrations return AADSTS500113 when adminconsent is
+        called with redirect_uri but no reply address is configured for the app.
+        We therefore default to omitting redirect_uri, and only include it on demand.
+        """
         cfg = AppConfig()
         tenant = cfg.tenant_id or "common"
-        redirect_uri = quote("https://login.microsoftonline.com/common/oauth2/nativeclient", safe="")
-        return (
-            f"https://login.microsoftonline.com/{tenant}/adminconsent"
-            f"?client_id={cfg.client_id}&redirect_uri={redirect_uri}"
-        )
+        base = f"https://login.microsoftonline.com/{tenant}/adminconsent?client_id={cfg.client_id}"
+        if include_redirect_uri:
+            return (
+                base
+                + "&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
+            )
+        return base
 
     def _raise_admin_consent_required(self):
         raise AdminConsentRequiredError(
             "Admin consent required for DeviceManagementConfiguration.Read.All. "
             "Ask a tenant admin to grant consent.",
-            self.build_admin_consent_url(),
+            self.build_admin_consent_url(include_redirect_uri=False),
         )
 
     # ------------------------------------------------------------------

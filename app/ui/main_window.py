@@ -284,7 +284,7 @@ class MainWindow(QMainWindow):
     def _open_admin_consent_page(self):
         from app.graph.auth import MSALAuth
 
-        url = MSALAuth.build_admin_consent_url()
+        url = MSALAuth.build_admin_consent_url(include_redirect_uri=False)
         webbrowser.open(url)
         self._status_bar.showMessage("Opened admin consent page")
 

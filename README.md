@@ -164,6 +164,14 @@ Add this permission in Entra, re-grant admin consent, then sign out once and log
 Ensure `Auth Mode` is set to `device_code` in Settings. If the token cache is
 already valid, no dialog is needed. Use "Sign out / Clear token cache" to force a new sign-in.
 
+
+**AADSTS500113: No reply address is registered**
+
+If this appears when opening admin consent, configure a redirect URI in Entra app registration
+(or use the app's built-in admin-consent URL without `redirect_uri`, available from Account menu).
+For public client/device-code apps, ensure **Mobile and desktop applications** is enabled and
+`https://login.microsoftonline.com/common/oauth2/nativeclient` is present.
+
 **`no such column: outcomes.status` error**
 
 Your database was created with v1.0. Update `app/db/database.py` to v1.1.0 —
