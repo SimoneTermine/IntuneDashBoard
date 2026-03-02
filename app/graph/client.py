@@ -12,7 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from app.config import GRAPH_BASE_URL_V1, GRAPH_BASE_URL_BETA
-from app.graph.auth import get_auth, AuthError
+from app.graph.auth import get_auth, AuthError, AdminConsentRequiredError
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,19 @@ class GraphClient:
                 continue
 
             if resp.status_code == 403:
+                lower_text = (resp.text or "").lower()
+                if (
+                    "aadsts65001" in lower_text
+                    or "consent" in lower_text
+                    or "insufficient privileges" in lower_text
+                ):
+                    from app.graph.auth import MSALAuth
+
+                    raise AdminConsentRequiredError(
+                        "Admin consent required for DeviceManagementConfiguration.Read.All. "
+                        "Ask a tenant admin to grant consent.",
+                        MSALAuth.build_admin_consent_url(),
+                    )
                 raise GraphError(
                     f"Access denied (403): {resp.text}. Check app permissions.",
                     status_code=403,
@@ -218,6 +231,8 @@ class GraphClient:
             orgs = data.get("value", [])
             name = orgs[0].get("displayName", "unknown") if orgs else "unknown"
             return {"ok": True, "details": f"Connected to tenant: {name}"}
+        except AdminConsentRequiredError as e:
+            return {"ok": False, "details": f"{e} Open admin consent page: {e.admin_consent_url}"}
         except AuthError as e:
             return {"ok": False, "details": f"Auth error: {e}"}
         except GraphError as e:

@@ -86,12 +86,27 @@ python main.py
 6. The dialog closes automatically once authentication succeeds
 7. Click **Sync Now** in the sidebar
 
-### Automatic scope re-authentication
+### Authentication & Token Cache
 
-When new Graph API permissions are added to the app (e.g. after an update),
-the token cache is **automatically cleared on next startup** and you will be
-prompted to sign in again with the updated permission set.
-No manual action required beyond completing the sign-in flow.
+- The app requests Graph delegated scopes at runtime from `DEFAULT_SCOPES`, including
+  `DeviceManagementConfiguration.Read.All`.
+- Token acquisition is **silent-first** (`acquire_token_silent`) and only falls back to
+  device code flow when interaction is actually required (first sign-in, missing consent,
+  expired/non-refreshable session).
+- Token cache path (Windows): `%LOCALAPPDATA%\IntuneDashboard\msal_cache.bin`
+  (legacy `%APPDATA%` cache is migrated automatically when found).
+- Cache protection:
+  - Preferred: DPAPI encrypted persistence via `msal-extensions`.
+  - Fallback: local file cache with restrictive permissions best-effort.
+- You can sign out from:
+  - **Account → Sign out / Clear token cache** (main menu), or
+  - **Settings → Sign out / Clear token cache**.
+- Sign-out removes MSAL accounts, deletes local cache files, and forces a fresh
+  device code login on next sync.
+
+If new scopes are added in a future release, the app performs incremental consent:
+it will prompt device code only once to request the new missing consent, then continue
+to reuse silent auth on subsequent sync runs.
 
 ### Demo Mode
 
@@ -137,18 +152,17 @@ and restart. A full sync will repopulate everything.
 
 The Remediations sync requires `DeviceManagementConfiguration.Read.All`.
 Verify admin consent has been granted in Entra for this permission,
-then clear the token cache (Settings → Clear Token Cache) and re-authenticate.
+then use **Sign out / Clear token cache** and re-authenticate.
 
 **"Permission denied" when running a remediation**
 
 The "Run on Device" action requires `DeviceManagementConfiguration.ReadWrite.All`.
-Add this permission in Entra, re-grant admin consent. The app will detect the
-scope change automatically on next restart and prompt for re-authentication.
+Add this permission in Entra, re-grant admin consent, then sign out once and log in again.
 
 **Device code dialog does not appear**
 
 Ensure `Auth Mode` is set to `device_code` in Settings. If the token cache is
-already valid, no dialog is needed. Use "Clear Token Cache" to force a new sign-in.
+already valid, no dialog is needed. Use "Sign out / Clear token cache" to force a new sign-in.
 
 **`no such column: outcomes.status` error**
 
@@ -177,18 +191,11 @@ python -m pytest tests/ -v             # with pytest
 
 ## Authentication — How It Works
 
-### Test Graph Connection
-Clicking **Test Graph Connection** in Settings always triggers a full re-authentication:
-1. The existing token cache is cleared.
-2. The device code dialog appears with a URL and a short code.
-3. Open the URL in any browser, enter the code, and sign in with your admin account.
-4. The dialog closes automatically and the connection result is shown.
-
-### Automatic scope upgrade
-When `DEFAULT_SCOPES` changes between versions (e.g. `DeviceManagementConfiguration.ReadWrite.All`
-was added in v1.1.0 for Remediations), the app detects the mismatch on startup and clears
-the token cache. The next sync or Test Connection will prompt for a new sign-in that includes
-the updated permissions — no manual action required.
+1. App tries `acquire_token_silent` with the full scope set.
+2. If silent fails because interaction/consent is required, app starts device code flow.
+3. On success, cache is persisted and reused across app restarts.
+4. If admin consent is required (for example `DeviceManagementConfiguration.Read.All` missing),
+   app shows a clear message and can open the tenant admin consent URL.
 
 ---
 

@@ -5,6 +5,7 @@ Global search bar, sync status, status bar.
 """
 
 import logging
+import webbrowser
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
     QSplitter, QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QKeySequence, QShortcut, QAction
 
 from app.ui.pages import (
     OverviewPage, DeviceExplorerPage, DeviceDetailPage,
@@ -54,7 +55,20 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self._sync_worker = None
         self._setup_ui()
+        self._setup_menu()
         self._setup_shortcuts()
+
+    def _setup_menu(self):
+        menu_bar = self.menuBar()
+        account_menu = menu_bar.addMenu("Account")
+
+        sign_out_action = QAction("Sign out / Clear token cache", self)
+        sign_out_action.triggered.connect(self._sign_out_clear_cache)
+        account_menu.addAction(sign_out_action)
+
+        admin_consent_action = QAction("Open Admin Consent Page", self)
+        admin_consent_action.triggered.connect(self._open_admin_consent_page)
+        account_menu.addAction(admin_consent_action)
 
     def _setup_ui(self):
         root = QWidget()
@@ -266,3 +280,32 @@ class MainWindow(QMainWindow):
         else:
             self._status_bar.showMessage(f"Sync failed: {message}")
             QMessageBox.warning(self, "Sync Failed", message)
+
+    def _open_admin_consent_page(self):
+        from app.graph.auth import MSALAuth
+
+        url = MSALAuth.build_admin_consent_url()
+        webbrowser.open(url)
+        self._status_bar.showMessage("Opened admin consent page")
+
+    def _sign_out_clear_cache(self):
+        reply = QMessageBox.question(
+            self,
+            "Sign out",
+            "You will be signed out and the local token cache will be removed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            from app.graph.auth import get_auth
+            from app.graph.client import reset_client
+
+            get_auth().clear_cache()
+            reset_client()
+            self._status_bar.showMessage("Signed out")
+            QMessageBox.information(self, "Signed out", "Token cache cleared successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to sign out: {e}")

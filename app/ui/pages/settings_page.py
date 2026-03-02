@@ -4,6 +4,7 @@ Credentials fields (Tenant ID, Client ID) are masked by default with a show/hide
 """
 
 import logging
+import webbrowser
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -101,7 +102,7 @@ class SettingsPage(QWidget):
         test_row = QHBoxLayout()
         self._test_btn = QPushButton("Test Graph Connection")
         self._test_btn.clicked.connect(self._test_connection)
-        self._logout_btn = QPushButton("Clear Token Cache (Logout)")
+        self._logout_btn = QPushButton("Sign out / Clear token cache")
         self._logout_btn.setObjectName("DangerButton")
         self._logout_btn.clicked.connect(self._logout)
         test_row.addWidget(self._test_btn)
@@ -325,13 +326,6 @@ class SettingsPage(QWidget):
             )
             return
 
-        # Always clear the token cache so the device code dialog is shown every time.
-        # "Test Graph Connection" is an explicit re-authentication, not a silent check.
-        from app.graph.auth import get_auth
-        from app.graph import auth as _auth_mod
-        get_auth().clear_cache()
-        _auth_mod._auth_instance = None   # reset singleton so next get_auth() re-inits
-
         cfg = AppConfig()
         self._test_btn.setEnabled(False)
         self._test_result.setPlainText("Waiting for sign-in…")
@@ -413,6 +407,19 @@ class SettingsPage(QWidget):
                         self._test_result.setPlainText(f"❌ Error: {e}")
                 else:
                     self._test_result.setPlainText(f"❌ Auth failed: {message}")
+                    if "Admin consent required" in message:
+                        consent = QMessageBox.question(
+                            self,
+                            "Admin consent required",
+                            "Admin consent required for DeviceManagementConfiguration.Read.All.\n"
+                            "Do you want to open the admin consent page now?",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.Yes,
+                        )
+                        if consent == QMessageBox.Yes:
+                            from app.graph.auth import MSALAuth
+
+                            webbrowser.open(MSALAuth.build_admin_consent_url())
 
                 self._test_btn.setEnabled(True)
 
@@ -428,6 +435,19 @@ class SettingsPage(QWidget):
                 self._test_result.setPlainText(
                     f"✅ {result['details']}" if result["ok"] else f"❌ {result['details']}"
                 )
+                if (not result["ok"]) and ("Admin consent required" in result["details"]):
+                    consent = QMessageBox.question(
+                        self,
+                        "Admin consent required",
+                        "Admin consent required for DeviceManagementConfiguration.Read.All.\n"
+                        "Do you want to open the admin consent page now?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes,
+                    )
+                    if consent == QMessageBox.Yes:
+                        from app.graph.auth import MSALAuth
+
+                        webbrowser.open(MSALAuth.build_admin_consent_url())
             except Exception as e:
                 self._test_result.setPlainText(f"❌ Error: {e}")
             finally:
