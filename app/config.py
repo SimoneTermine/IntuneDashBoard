@@ -36,8 +36,6 @@ DEFAULT_SCOPES = [
     "https://graph.microsoft.com/User.Read.All",
     "https://graph.microsoft.com/Device.Read.All",
     "https://graph.microsoft.com/DeviceManagementRBAC.Read.All",
-    # Required for Remediations "Run on Device" action
-    "https://graph.microsoft.com/DeviceManagementConfiguration.ReadWrite.All",
 ]
 
 DEFAULT_CONFIG: Dict[str, Any] = {

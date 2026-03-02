@@ -131,13 +131,24 @@ class MSALAuth:
     # Consent helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _has_required_scopes(token_result: dict, requested_scopes: list) -> bool:
-        granted = set((token_result.get("scope") or "").lower().split())
+    def _missing_required_scopes(token_result: dict, requested_scopes: list) -> list[str]:
+        """
+        Return missing scope names when MSAL response exposes granted scopes.
+
+        If the result does not contain a `scope` field, return empty list and trust
+        the token (Graph/API call will enforce effective permissions).
+        """
+        scope_value = token_result.get("scope")
+        if not scope_value:
+            return []
+
+        granted = set(scope_value.lower().split())
+        missing: list[str] = []
         for scope in requested_scopes:
             name = scope.split("/")[-1].lower()
             if name not in granted:
-                return False
-        return True
+                missing.append(scope.split("/")[-1])
+        return missing
 
     @staticmethod
     def build_admin_consent_url(include_redirect_uri: bool = False) -> str:
@@ -158,10 +169,14 @@ class MSALAuth:
             )
         return base
 
-    def _raise_admin_consent_required(self):
+    def _raise_admin_consent_required(self, missing_scopes: list[str] | None = None):
+        suffix = ""
+        if missing_scopes:
+            suffix = f" Missing delegated scope(s): {', '.join(missing_scopes)}."
         raise AdminConsentRequiredError(
-            "Admin consent required for DeviceManagementConfiguration.Read.All. "
-            "Ask a tenant admin to grant consent.",
+            "Admin consent required for one or more Microsoft Graph permissions."
+            + suffix
+            + " Ask a tenant admin to grant consent.",
             self.build_admin_consent_url(include_redirect_uri=False),
         )
 
@@ -180,10 +195,16 @@ class MSALAuth:
         accounts = app.get_accounts()
         if accounts:
             result = app.acquire_token_silent(scopes, account=accounts[0])
-            if result and "access_token" in result and self._has_required_scopes(result, scopes):
-                self._save_cache()
-                logger.debug("Token acquired silently")
-                return result["access_token"]
+            if result and "access_token" in result:
+                missing = self._missing_required_scopes(result, scopes)
+                if not missing:
+                    self._save_cache()
+                    logger.debug("Token acquired silently")
+                    return result["access_token"]
+                logger.info(
+                    "Cached token appears to miss required scope(s): %s. Falling back to device code.",
+                    ", ".join(missing),
+                )
 
             if result and result.get("error") in {"consent_required", "interaction_required", "invalid_grant"}:
                 logger.info("Silent auth requires interaction/consent, falling back to device code")
@@ -208,8 +229,9 @@ class MSALAuth:
                 )
             raise AuthError(f"Authentication failed: {result.get('error_description', result)}")
 
-        if not self._has_required_scopes(result, scopes):
-            self._raise_admin_consent_required()
+        missing = self._missing_required_scopes(result, scopes)
+        if missing:
+            self._raise_admin_consent_required(missing)
 
         self._save_cache()
         return result["access_token"]
