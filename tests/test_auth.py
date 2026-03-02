@@ -76,3 +76,26 @@ def test_admin_consent_url_defaults_without_redirect_uri():
 def test_admin_consent_url_can_include_redirect_uri():
     url = MSALAuth.build_admin_consent_url(include_redirect_uri=True)
     assert "redirect_uri=" in url
+
+
+def test_get_token_device_code_surfaces_aadsts1003031(monkeypatch):
+    auth = MSALAuth()
+
+    fake_app = Mock()
+    fake_app.get_accounts.return_value = []
+    fake_app.initiate_device_flow.return_value = {
+        "user_code": "ABCD-1234",
+        "verification_uri": "https://microsoft.com/devicelogin",
+        "message": "Sign in",
+    }
+    fake_app.acquire_token_by_device_flow.return_value = {
+        "error": "invalid_client",
+        "error_description": "AADSTS1003031: Misconfigured required resource access in client application registration.",
+    }
+
+    monkeypatch.setattr(auth, "_build_public_app", lambda: fake_app)
+
+    with pytest.raises(Exception) as exc:
+        auth.get_token_device_code()
+
+    assert "AADSTS1003031" in str(exc.value)

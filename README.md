@@ -93,8 +93,8 @@ python main.py
 - Token acquisition is **silent-first** (`acquire_token_silent`) and only falls back to
   device code flow when interaction is actually required (first sign-in, missing consent,
   expired/non-refreshable session).
-- Token cache path (Windows): `%LOCALAPPDATA%\IntuneDashboard\msal_cache.bin`
-  (legacy `%APPDATA%` cache is migrated automatically when found).
+- Token cache path (Windows): `%APPDATA%\IntuneDashboard\msal_cache.bin`
+  (legacy `%LOCALAPPDATA%` cache is migrated automatically when found).
 - Cache protection:
   - Preferred: DPAPI encrypted persistence via `msal-extensions`.
   - Fallback: local file cache with restrictive permissions best-effort.

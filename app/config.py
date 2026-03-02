@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or Path.home())
 ROAMING_APP_DATA = Path(os.environ.get("APPDATA") or Path.home())
 
-APP_DIR = LOCAL_APP_DATA / "IntuneDashboard"
+APP_DIR = ROAMING_APP_DATA / "IntuneDashboard"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = APP_DIR / "intune_dashboard.db"
@@ -22,7 +22,7 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR = APP_DIR / "exports"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 MSAL_CACHE_PATH = APP_DIR / "msal_cache.bin"
-LEGACY_MSAL_CACHE_PATH = ROAMING_APP_DATA / "IntuneDashboard" / "msal_cache.bin"
+LEGACY_MSAL_CACHE_PATH = LOCAL_APP_DATA / "IntuneDashboard" / "msal_cache.bin"
 CONFIG_PATH = APP_DIR / "config.json"
 
 GRAPH_BASE_URL_V1   = "https://graph.microsoft.com/v1.0"

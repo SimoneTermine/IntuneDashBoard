@@ -53,14 +53,14 @@ class MSALAuth:
     # Cache persistence
     # ------------------------------------------------------------------
     def _migrate_legacy_cache_if_needed(self):
-        """Move old roaming cache to local app data when possible."""
+        """Move old local-appdata cache to roaming path when needed."""
         if self._cache_path.exists() or not LEGACY_MSAL_CACHE_PATH.exists():
             return
 
         try:
             self._cache_path.write_bytes(LEGACY_MSAL_CACHE_PATH.read_bytes())
             LEGACY_MSAL_CACHE_PATH.unlink()
-            logger.info("Migrated MSAL cache from legacy APPDATA path to LOCALAPPDATA")
+            logger.info("Migrated MSAL cache from legacy LOCALAPPDATA path to APPDATA")
         except Exception as e:
             logger.warning(f"Could not migrate legacy MSAL cache: {e}")
 
@@ -74,7 +74,7 @@ class MSALAuth:
             logger.info("Using encrypted DPAPI token cache")
             return
         except Exception as e:
-            logger.info(f"DPAPI cache unavailable, using SerializableTokenCache fallback: {e}")
+            logger.debug(f"DPAPI cache unavailable, using SerializableTokenCache fallback: {e}")
 
         self._cache = msal.SerializableTokenCache()
         if self._cache_path.exists():
@@ -201,6 +201,11 @@ class MSALAuth:
             lowered = error_text.lower()
             if "aadsts65001" in lowered or "consent_required" in lowered or "insufficient" in lowered:
                 self._raise_admin_consent_required()
+            if "aadsts1003031" in lowered:
+                raise AuthError(
+                    "AADSTS1003031: Misconfigured required resource access in client application registration. "
+                    "Open Entra App Registration and fix API permissions/manifest, then grant admin consent."
+                )
             raise AuthError(f"Authentication failed: {result.get('error_description', result)}")
 
         if not self._has_required_scopes(result, scopes):
