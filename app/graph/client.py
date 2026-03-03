@@ -6,6 +6,8 @@ app/graph/client.py — v1.2.2
 
 import logging
 import time
+import json
+
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
@@ -150,7 +152,10 @@ class GraphClient:
             if resp.status_code == 204:
                 return {}
 
-            return resp.json()
+            try:
+                return resp.json()
+            except Exception:
+                return json.loads(resp.content.decode("utf-8-sig"))
 
         raise GraphError(f"Max retries exceeded for {url}")
 

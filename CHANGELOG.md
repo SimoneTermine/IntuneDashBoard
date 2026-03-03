@@ -10,278 +10,163 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.2.7] — 2026-03-03
+## [1.2.9] — 2026-03-03
 
 ### Fixed
-- **App Ops install status counters still 0 — root cause confirmed**: `/deviceStatuses`
-  and `/deviceInstallStates` were called with a `$select` parameter listing specific
-  fields (`displayVersion`, `userPrincipalName`, `userName`, etc.). These endpoints
-  are polymorphic sub-resources — each app type has a different OData derived schema.
-  Graph returns HTTP 400 `"InvalidQueryParameter"` / `"Bad Request"` when any
-  requested field is not declared in the derived schema for that app type.
-  This is the same issue that caused missing apps in v1.2.4 on the `mobileApps`
-  collection; it also affects the install-status sub-endpoints.
+- **App Ops — install counters still 0 in the UI despite overview data arriving**
+  — two root causes identified from `app_ops.log`:
 
-  Fix: `$select` removed from both `_sync_device_statuses()` and
-  `_sync_win32_statuses()`. Graph now returns all available fields for every
-  app type.
+  1. **`getDeviceInstallStatusReport` called with `api_version="v1.0"`** — the
+     endpoint is beta-only for this tenant; v1.0 returned HTTP 400
+     `"Resource not found for the segment 'getDeviceInstallStatusReport'"`.
+     Fix: changed to `api_version="beta"` in `_fetch_device_install_status()`.
 
-- **400 errors logged without the actual Graph message**: the `except GraphError`
-  handler for 400s previously logged a hardcoded `"device check-in pending"`
-  message instead of the real Graph error. Now logs `e.raw` (the full response
-  body) so the actual `errorCode` and `message` from Graph are visible in
-  `app_ops.log`.
+  2. **`get_app_install_summary()` and `get_app_monitoring_kpis()` read only from
+     `DeviceAppStatus`** — the table remains empty until `getDeviceInstallStatusReport`
+     succeeds, even though `getAppStatusOverviewReport` (always working) stores
+     accurate counts in `App.raw_json["_install_overview"]` after every sync.
+     Fix: `get_app_install_summary()` now reads `_install_overview` from
+     `App.raw_json` as primary source; `get_app_monitoring_kpis()` sums all apps'
+     overview counts for KPI cards. `DeviceAppStatus` is kept as fallback for
+     demo mode and backwards compatibility.
+
+### Changed
+- `app/analytics/app_monitoring_queries.py`: `get_app_install_summary()` and
+  `get_app_monitoring_kpis()` use `App.raw_json["_install_overview"]` as primary
+  source. `get_install_state_distribution()` uses the same overview when available.
+- `app/collector/apps.py`: `_fetch_device_install_status()` uses `api_version="beta"`.
 
 ---
 
-## [1.2.6] -- 2026-03-03
+## [1.2.8] — 2026-03-03
 
 ### Fixed
-- **Device code prompt not appearing during Sync Now** -- When the cached
-  token was expired or missing required scopes, `SyncEngine` initiated a
-  device code flow but had no callback, so the flow ran silently and the sync
-  stalled waiting for a sign-in that could never happen.
+- **App Ops — all install status endpoints returning HTTP 400** — root cause:
+  the `/mobileApps/{id}/deviceStatuses` and `/mobileApps/{id}/deviceInstallStates`
+  navigation properties were removed from the Graph API `mobileApp` base class
+  in May 2023 (MC531735). They return `"Resource not found for the segment"`
+  for every app type, regardless of OData type cast.
 
-  Fix (three files):
-  - `app/ui/workers/sync_worker.py`: `SyncWorker` gains a `device_code_ready`
-    signal (user_code, verification_uri). The `run()` method passes an
-    `on_device_code` callback to `SyncEngine.run_sync()`.
-  - `app/collector/sync_engine.py`: `run_sync()` gains a
-    `device_code_callback` parameter. The client is now authenticated
-    explicitly at the very start of every sync (before any API call) so
-    the sign-in dialog appears up front rather than mid-sync.
-  - `app/ui/main_window.py`: `run_sync()` connects `device_code_ready` to
-    a new `_on_sync_device_code()` / `_show_device_code_dialog()` method
-    that renders the same sign-in dialog used by Settings -> Test Graph
-    Connection (see `main_window_PATCH.py` for the exact replacement).
+  Fix: replaced both endpoints with the official Intune Reports API:
+  - `POST /beta/deviceManagement/reports/getAppStatusOverviewReport`
+    (KPI aggregates: Installed, Failed, Pending, NotInstalled, NotApplicable)
+  - `POST /beta/deviceManagement/reports/getDeviceInstallStatusReport`
+    (per-device rows: DeviceId, DeviceName, InstallState, ErrorCode, …)
 
-- **`diagnose_apps.py` stuck waiting with no prompt** -- The script called
-  `client.authenticate()` without a callback, so the device code was never
-  printed. Fixed: a `device_code_prompt()` callback now prints the URL and
-  code clearly to the console.
+  Aggregated counts stored in `App.raw_json["_install_overview"]` for UI use.
+  Per-device rows stored in `DeviceAppStatus` for drill-down and install log.
 
-### Added
-- `app/ui/main_window.py`: `_show_device_code_dialog()` method (reusable
-  sign-in dialog extracted from settings_page logic).
+  Ref: https://techcommunity.microsoft.com/blog/intunecustomersuccess/
+  support-tip-retrieving-intune-apps-reporting-data-from-microsoft-graph-beta-api
 
-### Notes
-- **App Ops status counters still 0**: confirmed by `app_ops.log` that Graph
-  returns HTTP 400 on `/deviceStatuses` and `/deviceInstallStates` for all 7
-  apps. This is a tenant data state issue, not a code bug: the apps were
-  recently deployed and the 3 enrolled devices have not yet checked in with
-  install status. Run `python diagnose_apps.py` after devices check in to
-  confirm data starts flowing. No code change needed.
+### Changed
+- `app/graph/endpoints.py`: removed `APP_DEVICE_STATUSES` / `APP_WIN32_INSTALL_STATES`;
+  added `APP_STATUS_OVERVIEW_REPORT` and `APP_DEVICE_INSTALL_STATUS_REPORT`.
+- `app/collector/apps.py`: full rewrite of install-status methods to use Reports API.
+- `diagnose_apps.py`: updated to test both Reports API endpoints.
+
+---
+
+## [1.2.7] — 2026-03-03
+
+### Fixed
+- **App Ops install status counters still 0 — root cause confirmed**: `$select` on
+  `/deviceStatuses` and `/deviceInstallStates` caused HTTP 400 for all app types
+  (polymorphic sub-resources). Removed `$select` from both calls.
+- **400 errors logged without actual Graph message**: now logs `e.raw` so the real
+  `errorCode` and `message` from Graph are visible in `app_ops.log`.
+
+---
+
+## [1.2.6] — 2026-03-03
+
+### Fixed
+- **Device code prompt not appearing during Sync Now** — `SyncWorker` now emits a
+  `device_code_ready` signal; `SyncEngine.run_sync()` authenticates explicitly at
+  the start; `MainWindow.run_sync()` shows the same sign-in dialog as Settings.
+- **`diagnose_apps.py` stuck waiting** — added console `device_code_prompt()` callback.
 
 ---
 
 ## [1.2.5] — 2026-03-03
 
 ### Fixed
-- **Only 3 apps visible — root cause confirmed**: The fix in v1.2.4 (removing
-  `$select`) was necessary but not sufficient. The **v1.0** `/mobileApps`
-  endpoint silently drops `winGetApp`, `officeSuiteApp`, and other modern app
-  types in some tenant configurations regardless of `$select` usage.
-  `sync_apps()` now calls `get_paged(MOBILE_APPS, api_version="beta")` which
-  returns the full polymorphic collection in all tenant configurations.
-- **Verbose per-app logging**: every app returned by Graph is now logged at
-  INFO level with its OData type and display name before upsert, so any
-  missing types are immediately visible in `app_ops.log` without DEBUG mode.
+- **Apps synced: 3 instead of 7** — v1.0 API silently excludes `winGetApp`,
+  `officeSuiteApp`, `windowsMicrosoftEdgeApp` in this tenant. Switched to beta API.
 
 ### Added
-- **`diagnose_apps.py`** — standalone diagnostic script (run from repo root).
-  Authenticates using the same device-code flow as the main app and:
-  - Queries `/mobileApps` with both v1.0 and beta, printing type counts for
-    each so the v1.0 vs beta difference is directly observable.
-  - Probes `/deviceStatuses` and `/deviceInstallStates` for every app and
-    prints the HTTP result and first record (if any), confirming whether
-    Graph has install tracking data for the tenant.
-  - Verifies token identity via the `/me` endpoint.
-
-### Notes
-- If `diagnose_apps.py` shows HTTP 400 on all install-status endpoints for all
-  apps, Graph genuinely has no per-device tracking data yet. This occurs when:
-  (a) apps were recently deployed and devices haven't checked in since, or
-  (b) the tenant's Graph API doesn't expose install tracking for these app types
-      (known limitation for certain app types like `windowsMicrosoftEdgeApp`).
-  In this case the App Ops status counters will remain at 0 until devices
-  check in and Graph populates the tracking data.
+- `diagnose_apps.py` standalone diagnostic tool (v1.0 vs beta comparison).
+- Verbose per-app type logging at INFO level.
 
 ---
 
 ## [1.2.4] — 2026-03-03
 
 ### Fixed
-- **App Ops — only win32 apps visible after sync ("Apps synced: 3" with 7 apps in
-  tenant)** — root cause: `$select` on the polymorphic `/deviceAppManagement/mobileApps`
-  collection caused Graph to silently drop app types whose OData derived schema does
-  not declare all requested fields. `winGetApp`, `officeSuiteApp`, and other types
-  were excluded while `win32LobApp` (which declares `publisher`, `description`, etc.)
-  continued to appear. Fix: `$select` is no longer sent for the `mobileApps` request.
-  `APP_SELECT_FIELDS` in `endpoints.py` is now `None`; `sync_apps()` calls
-  `get_paged(MOBILE_APPS)` with no params so all fields and all app types are returned.
-- **win32LobApp → 400 on `/deviceInstallStates`** — some tenants return
-  `"Resource not found for the segment 'deviceInstallStates'"` for win32 apps
-  despite the type being `win32LobApp` (known Graph behavioural inconsistency).
-  `_sync_win32_statuses()` now automatically falls back to `/deviceStatuses`
-  when a 400 is received, instead of logging a WARNING and giving up.
-- **`windowsMicrosoftEdgeApp` 400 on `/deviceStatuses`** — downgraded from WARNING
-  to DEBUG. Edge is a system-managed app type that does not expose per-device
-  install status; the 400 is expected and informational.
-
-### Changed
-- `APP_SELECT_FIELDS` in `app/graph/endpoints.py` set to `None` with a detailed
-  comment explaining why `$select` must not be used for the mobileApps collection.
+- **Only win32 apps visible** — `$select` on polymorphic `mobileApps` collection
+  silently dropped non-win32 types. `APP_SELECT_FIELDS` set to `None`.
+- **win32LobApp 400 on `/deviceInstallStates`** — automatic fallback to `/deviceStatuses`.
 
 ---
 
 ## [1.2.3] — 2026-03-03
 
 ### Fixed
-- **App Ops — all status counters still 0 after sync** — root cause identified:
-  `PRAGMA foreign_keys=ON` is active in `database.py`. When `_sync_device_statuses`
-  / `_sync_win32_statuses` used a **single shared session** for the entire app batch,
-  a single `IntegrityError` (FK violation — `deviceId` not yet in `devices` table)
-  rolled back the whole batch, leaving `DeviceAppStatus` empty.
-  Fixed by moving each record write into its own `session_scope` transaction in
-  `_save_device_app_status()` — FK failures on individual devices no longer affect
-  the rest of the batch.
-- **`windowsMicrosoftEdgeApp`** was missing from `DEVICE_STATUS_SUPPORTED_TYPES`
-  and therefore silently skipped during install-status sync. Added along with
-  `windowsMicrosoftEdgeAppChannel`, `win32CatalogApp`, and `windowsWebApp`.
-- **Install-status errors logged at DEBUG** — meaningful failures (non-400/404
-  Graph errors, DB write errors) were invisible at default INFO level. Upgraded
-  to WARNING so they appear in `collector.log` / `app_ops.log` without requiring
-  DEBUG mode.
-- **Drill-down and Install Log filter returned empty** — downstream symptom of
-  the empty `DeviceAppStatus` table. With the FK-transaction fix above, both
-  features now work correctly once a sync completes.
+- **All status counters 0** — FK constraint + shared session caused entire batch
+  rollback on first FK violation. Per-record `session_scope` transactions.
+- `windowsMicrosoftEdgeApp` missing from `DEVICE_STATUS_SUPPORTED_TYPES`.
+- Meaningful errors upgraded from DEBUG to WARNING.
 
 ### Added
-- **`app_ops.log`** — dedicated log file at
-  `%APPDATA%\IntuneDashboard\logs\app_ops.log`.
-  Receives entries from three sources:
-  - `app.ui.pages.app_ops` — KPI refresh, catalog load, drill-down navigation,
-    install log filter, error analysis
-  - `app.analytics.app_monitoring_queries` — SQL query results and record counts
-    for every App Ops data fetch (KPIs, install log, drill-down)
-  - `app.collector.apps` — per-app sync stats (records saved/skipped) and
-    per-record DB errors
-  Follows the same SCCM-style 2 MB rotation as all other logs.
+- `app_ops.log` dedicated subsystem log (SCCM-style 2 MB rotation).
 
 ---
 
 ## [1.2.2] — 2026-03-03
 
 ### Fixed
-- **`GraphClient.test_connection()` AttributeError** — method was not reachable
-  at runtime after auth. Rewrote `client.py` to guarantee the method is always
-  present; `AdminConsentRequiredError` is now re-raised instead of silently caught
-  so the Settings page can surface the consent button correctly.
-- **App Ops — all status counters showed 0** — `get_app_monitoring_kpis()` and
-  `get_app_install_summary()` used exact-case SQL equality (`== "installed"`).
-  Microsoft Graph returns `"success"` for WinGet app installs and may vary
-  capitalisation across app types. All state comparisons are now
-  case-insensitive (`func.lower().in_()`) and include canonical variant spellings:
-  - `"success"` → counted as *installed*
-  - `"installfailed"` / `"uninstallFailed"` → counted as *failed*
-  - `"pending"` / `"downloading"` / `"installing"` → counted as *pending*
-  - `"notApplicable"` / `"excluded"` → counted as *not installed*
-- **`get_install_state_distribution()`** normalises variant state names before
-  building the overview bar, so colours map consistently.
-- **`get_app_error_analysis()`** now uses the same case-insensitive failed-state
-  filter as the KPI query.
+- `GraphClient.test_connection()` AttributeError at runtime.
+- App Ops counters 0 due to exact-case state comparisons; now case-insensitive
+  with Graph variant spelling support (`"success"` → installed, etc.).
 
 ### Changed
-- **Log rotation rewritten** (`app/logging_config.py`). Replaced
-  `RotatingFileHandler` (`.log.1 / .log.2` style) with a new
-  `SccmRotatingFileHandler` that mirrors SCCM/ConfigMgr behaviour:
-  - Threshold: **2 MB** per file (down from 10 MB).
-  - On rotation: active log is renamed  `<name>_<YYYY-MM-DD>.log`.
-  - Collision handling: appends `_1`, `_2`, … when today's archive already exists.
-  - Fresh `<name>.log` is opened immediately after rename.
-  - On-disk format: `intune_dashboard_2026-03-03.log`,
-    `intune_dashboard_2026-03-03_1.log`, …
+- Log rotation: `SccmRotatingFileHandler` (2 MB threshold, date-stamped archives).
 
 ---
 
 ## [1.2.1] — 2026-03-03
 
 ### Removed
-- **Proactive Remediations feature** removed entirely pending redesign.
-  Deleted files: `app/collector/remediations.py`, `app/ui/pages/remediations_page.py`.
-  Removed from: sidebar nav, `__init__.py`, sync pipeline, `Remediation` DB model,
-  endpoint constants, `remediation_url()` / `open_remediation_portal()` helpers.
-- **`DeviceManagementConfiguration` scopes** (`Read.All`, `ReadWrite.All`) removed
-  from `DEFAULT_SCOPES` — no longer required without the Remediations feature.
-
-### Changed
-- `database.py` migration now drops the orphaned `remediations` table automatically
-  on first startup after upgrade (no manual action needed).
+- Proactive Remediations feature and `DeviceManagementConfiguration` scopes.
 
 ---
 
 ## [1.2.0] — 2026-03-02
 
 ### Added
-- **DPAPI-encrypted token cache** via msal-extensions (Windows). Cache stored at
-  `%APPDATA%\IntuneDashboard\msal_cache.bin` — encrypted and bound to the Windows
-  user account. Falls back to plain SerializableTokenCache if msal-extensions is
-  not installed.
-- **Sign out / Clear Token Cache** button renamed and improved. `sign_out()` now
-  removes MSAL accounts, deletes cache files, and resets the singleton.
-- **Copy Code button** in device code dialog — copies the sign-in code to the
-  clipboard with one click.
-- **Admin Consent URL** helper (`admin_consent_url()`, `open_admin_consent_page()`)
-  and corresponding button in Settings.
-- **`AdminConsentRequiredError`** exception raised on AADSTS65001 / consent_required
-  errors, with a clear message directing the admin to grant consent.
-- **`cache_type()`** method on `MSALAuth` returns `'DPAPI'` or `'plain'`; shown in
-  Test Connection result.
+- DPAPI-encrypted token cache, Sign out UI, Copy Code button, Admin Consent URL.
+- `AdminConsentRequiredError` on AADSTS65001.
 
 ### Fixed
-- **Repeated device code flow** on ReadWrite.All vs Read.All scope split.
-  `_has_required_scopes()` now treats a granted `ReadWrite.All` as satisfying a
-  `Read.All` requirement, preventing unnecessary re-authentication.
-- **Legacy plain-text cache migration** — if DPAPI is available and the existing
-  cache file is plain JSON, it is deleted and the user re-authenticates once with
-  the encrypted store.
+- Repeated device code on ReadWrite.All vs Read.All scope split.
+- Legacy plain-text cache migration to DPAPI.
 
 ---
 
 ## [1.1.1] — 2026-03-02
 
 ### Fixed
-- **Device code dialog missing on "Test Graph Connection"**: the button was silently
-  returning a cached token without showing the sign-in prompt.
-- **Scope tracking first-run bug**: `msal_scopes.json` not present on first run
-  caused the cache to remain stale instead of being cleared.
-- **`app/db/database.py` migration**: `outcomes` table is dropped and recreated if
-  the v1.0.0 schema is detected (missing `status` column).
-- **`DriftReport` model missing** from `models.py`; restored.
+- Device code dialog missing on "Test Graph Connection".
+- Scope tracking first-run bug.
+- `outcomes` / `device_app_statuses` DB migration.
 
 ---
 
 ## [1.1.0] — 2026-03-02
 
 ### Added
-- **Centralised portal URL builder** (`app/utils/intune_links.py`).
-- **Scope change detection** in `auth.py`.
-- **Device code dialog** in Settings → Test Graph Connection.
-- **Unit tests** (`tests/test_intune_links.py`) — 50 test cases.
-- **Credential masking** in Settings (👁 toggle).
-- `app/version.py` — single source of truth for version and app name.
-- `GraphClient.post()` method for write operations.
-- **DB migration** in `database.py` (`_migrate_db`).
-
-### Fixed
-- Compliance policy portal URLs.
-- Windows/macOS Update config policy URLs.
-- App portal URLs (`SettingsMenu/~/0`).
-- Generic config policy fallback (`DeviceConfigurationMenuBlade`).
-
-### Changed
-- Window title updated to include version.
-- README rewritten in English.
+- Centralised portal URL builder, scope change detection, device code dialog,
+  unit tests, credential masking, `app/version.py`, `GraphClient.post()`, DB migration.
 
 ---
 
@@ -289,5 +174,4 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - Initial release: Device Explorer, Policy Explorer, App Ops, Governance,
-  Explainability, Group Usage, Graph Query Lab, context menus, export,
-  demo mode, per-subsystem logging.
+  Explainability, Group Usage, Graph Query Lab, context menus, export, demo mode.

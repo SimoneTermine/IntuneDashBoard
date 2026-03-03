@@ -23,14 +23,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from app.logging_config import setup_logging
-setup_logging("DEBUG")
+setup_logging("INFO")
 
 import logging
 log = logging.getLogger("diagnose")
 
 from app.config import AppConfig
 from app.graph.client import GraphClient, GraphError
-from app.graph.endpoints import MOBILE_APPS, APP_DEVICE_STATUSES, APP_WIN32_INSTALL_STATES
+from app.graph.endpoints import (
+    MOBILE_APPS,
+    APP_STATUS_OVERVIEW_REPORT,
+    APP_DEVICE_INSTALL_STATUS_REPORT,
+)
 
 
 def hr(title=""):
@@ -40,108 +44,102 @@ def hr(title=""):
         print(f"{'─' * 70}")
 
 
-def query(client, endpoint, api_version="v1.0", params=None, label=""):
-    desc = f"[{api_version}] {endpoint}"
-    if label:
-        desc = f"{label}: {desc}"
-    try:
-        items = client.get_all(endpoint, params=params, api_version=api_version)
-        print(f"  OK  {desc}  ->  {len(items)} items")
-        return items
-    except GraphError as e:
-        # Print the full raw response so the actual Graph error message is visible
-        raw_msg = ""
-        if e.raw:
-            try:
-                raw_msg = json.dumps(e.raw, indent=4)
-            except Exception:
-                raw_msg = str(e.raw)
-        print(f"  ERR {desc}  ->  HTTP {e.status_code}: {e}")
-        if raw_msg:
-            print(f"      Raw response:\n{raw_msg}")
-        return None
-    except Exception as e:
-        print(f"  ERR {desc}  ->  {type(e).__name__}: {e}")
-        return None
-
-
 def device_code_prompt(flow):
-    """Print device code to console so the user can sign in."""
     uri  = flow.get("verification_uri", "https://microsoft.com/devicelogin")
     code = flow.get("user_code", "?")
     print(f"\n{'=' * 70}")
-    print(f"  ACTION REQUIRED: Open this URL in your browser:")
-    print(f"    {uri}")
-    print(f"\n  Enter this code: {code}")
+    print(f"  Apri nel browser: {uri}")
+    print(f"  Codice:           {code}")
     print(f"{'=' * 70}\n")
+
+
+def parse_report(resp: dict) -> list[dict]:
+    """Converte {Schema, Values} in lista di dict."""
+    schema = resp.get("Schema", [])
+    values = resp.get("Values", [])
+    cols   = [s["Column"] for s in schema]
+    return [dict(zip(cols, row)) for row in values]
 
 
 def main():
     cfg = AppConfig()
     print(f"\nTenant : {cfg.tenant_id or '(not set)'}")
     print(f"Client : {cfg.client_id or '(not set)'}")
-
     if not cfg.tenant_id or not cfg.client_id:
-        print("\nERROR: tenant_id or client_id not configured in the app Settings.")
+        print("ERROR: configura tenant_id e client_id nelle impostazioni.")
         sys.exit(1)
 
-    print("\nAuthenticating (device code flow if needed)...")
+    print("\nAutenticazione...")
     client = GraphClient()
     try:
         client.authenticate(device_code_callback=device_code_prompt)
     except Exception as e:
-        print(f"\nAuthentication failed: {e}")
+        print(f"Autenticazione fallita: {e}")
         sys.exit(1)
-    print("Authenticated OK.")
+    print("Autenticato OK.")
 
-    # ── 1. Compare v1.0 vs beta ───────────────────────────────────────────────
-    hr("1. /mobileApps -- v1.0 vs beta comparison")
-    apps_v1   = query(client, MOBILE_APPS, "v1.0",  label="v1.0 ")
-    apps_beta = query(client, MOBILE_APPS, "beta",  label="beta ")
+    # -- 1. Lista app ---------------------------------------------------------
+    hr("1. App dal tenant (beta, no $select)")
+    apps = list(client.get_paged(MOBILE_APPS, api_version="beta"))
+    print(f"  Totale app: {len(apps)}")
+    types: dict[str, int] = {}
+    for a in apps:
+        t = a.get("@odata.type", "?").split(".")[-1]
+        types[t] = types.get(t, 0) + 1
+    for t, n in sorted(types.items()):
+        print(f"    {t}: {n}")
 
-    for label, apps in [("v1.0", apps_v1), ("beta", apps_beta)]:
-        if apps is not None:
-            types = {}
-            for a in apps:
-                t = a.get("@odata.type", "unknown").split(".")[-1]
-                types[t] = types.get(t, 0) + 1
-            print(f"  {label} types: {dict(sorted(types.items()))}")
+    # -- 2. Reports API per ogni app ------------------------------------------
+    hr("2. Reports API (getAppStatusOverviewReport + getDeviceInstallStatusReport)")
 
-    # ── 2. Per-app install status ─────────────────────────────────────────────
-    apps = apps_beta or apps_v1 or []
-    if not apps:
-        print("\nNo apps returned -- cannot probe install status.")
-        return
-
-    hr("2. Per-app install status endpoint probing")
     for app in apps:
-        app_id   = app.get("id", "?")
-        app_name = app.get("displayName", "?")
-        app_type = app.get("@odata.type", "unknown").split(".")[-1]
+        app_id   = app.get("id", "")
+        app_type = app.get("@odata.type", "?").split(".")[-1]
+        name     = app.get("displayName", "?")
+        print(f"\n  [{app_type}] {name!r}  ({app_id})")
 
-        print(f"\n  [{app_type}] {app_name!r}  ({app_id})")
+        # Overview
+        try:
+            resp = client.post(
+                APP_STATUS_OVERVIEW_REPORT,
+                json={"filter": f"(ApplicationId eq '{app_id}')"},
+                api_version="beta",
+            )
+            rows = parse_report(resp)
+            if rows:
+                r = rows[0]
+                print(f"    Overview: installed={r.get('InstalledDeviceCount',0)} "
+                      f"failed={r.get('FailedDeviceCount',0)} "
+                      f"pending={r.get('PendingInstallDeviceCount',0)} "
+                      f"notInstalled={r.get('NotInstalledDeviceCount',0)} "
+                      f"notApplicable={r.get('NotApplicableDeviceCount',0)}")
+            else:
+                print("    Overview: 0 righe (nessun dato ancora)")
+        except GraphError as e:
+            print(f"    Overview: HTTP {e.status_code} -- {e.raw or e}")
+        except Exception as e:
+            print(f"    Overview: errore -- {e}")
 
-        ds = query(client, APP_DEVICE_STATUSES.format(app_id=app_id), "beta",
-                   params={"$select": "id,deviceId,deviceName,installState,errorCode,lastSyncDateTime"},
-                   label="    /deviceStatuses    ")
-        di = query(client, APP_WIN32_INSTALL_STATES.format(app_id=app_id), "beta",
-                   params={"$select": "id,deviceId,deviceName,installState,errorCode,lastSyncDateTime"},
-                   label="    /deviceInstallStates")
+        # Per-device
+        try:
+            resp = client.post(
+                APP_DEVICE_INSTALL_STATUS_REPORT,
+                json={"filter": f"(ApplicationId eq '{app_id}')", "top": 5, "orderBy": []},
+                api_version="v1.0",
+            )
+            rows = parse_report(resp)
+            print(f"    Per-device: {len(rows)} righe")
+            if rows:
+                r = rows[0]
+                print(f"      Esempio: device={r.get('DeviceName','?')} "
+                      f"state={r.get('InstallState','?')} "
+                      f"user={r.get('UserName', r.get('UPN','?'))}")
+        except GraphError as e:
+            print(f"    Per-device: HTTP {e.status_code} -- {e.raw or e}")
+        except Exception as e:
+            print(f"    Per-device: errore -- {e}")
 
-        for lbl, result in [("/deviceStatuses", ds), ("/deviceInstallStates", di)]:
-            if result:
-                print(f"    First {lbl} record:")
-                print(f"      {json.dumps(result[0], default=str, indent=6)}")
-
-    # ── 3. Token identity ─────────────────────────────────────────────────────
-    hr("3. Token identity (/me)")
-    try:
-        me = client.get("me", api_version="v1.0")
-        print(f"  Signed in as: {me.get('userPrincipalName', me.get('id', '?'))}")
-    except Exception as e:
-        print(f"  /me failed: {e}")
-
-    hr("Diagnosis complete")
+    hr("Diagnosi completata")
     print()
 
 
