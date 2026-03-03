@@ -10,7 +10,13 @@ Queries:
   get_all_install_records()       — flat table: device × app × state
   get_device_installs_for_app()   — drill-down: all devices for one app
   get_app_error_analysis()        — error code clustering with descriptions
-  get_install_trend_by_state()    — state distribution across all apps
+  get_install_state_distribution()— state distribution across all apps
+
+v1.2.2 fix: state comparisons are now case-insensitive (func.lower) and
+include Microsoft Graph variant spellings:
+  - "success" is treated as "installed" (returned by some WinGet app endpoints)
+  - "pendingInstall" / "pendinginstall" / "pending" all count as pending
+  - "notInstalled" / "notinstalled" / "notApplicable" count as not-installed
 """
 
 from __future__ import annotations
@@ -25,6 +31,17 @@ from app.db.database import session_scope
 from app.db.models import App, DeviceAppStatus, Device
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical state buckets (all lower-case; matched via func.lower() in queries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Graph API may return "success" (winGetApp) or "installed" (Win32/LOB/Store)
+_INSTALLED_STATES    = ["installed", "success"]
+_FAILED_STATES       = ["failed", "installfailed", "uninstallfailed"]
+_PENDING_STATES      = ["pendinginstall", "pending", "downloading", "installing"]
+_NOT_INSTALLED_STATES = ["notinstalled", "not installed", "notapplicable", "excluded"]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Win32 / Intune error code catalogue
@@ -56,112 +73,114 @@ ERROR_CATALOGUE: dict[int, str] = {
     -2016330008: "Sync failed — device offline or unreachable",
     -2147024891: "Access denied (0x80070005)",
     -2147024773: "File not found (0x8007007B)",
-    -2147024809: "Invalid data / corrupted download",
+    -2147024809: "The parameter is incorrect (0x80070057)",
+    -2016345106: "Content not found — check app content / supersedence",
+    -2016330860: "Application not applicable to this device",
+    -2016281112: "Enrollment failed or enrollment state issue",
 }
+
+
+def _err_desc(code: int | None) -> str:
+    if code is None:
+        return "—"
+    try:
+        val = int(code)
+        # Try direct lookup first
+        if val in ERROR_CATALOGUE:
+            return ERROR_CATALOGUE[val]
+        # Try unsigned 32-bit interpretation
+        unsigned = val & 0xFFFFFFFF
+        if unsigned in ERROR_CATALOGUE:
+            return ERROR_CATALOGUE[unsigned]
+        return f"Unknown error code"
+    except Exception:
+        return "—"
 
 
 def _hex(code: int | None) -> str:
     if code is None:
         return "—"
     try:
-        val = int(code)
-        # Normalise to unsigned 32-bit for display
-        if val < 0:
-            val = val & 0xFFFFFFFF
-        return f"0x{val:08X}"
+        return f"0x{int(code) & 0xFFFFFFFF:08X}"
     except Exception:
         return str(code)
-
-
-def _err_desc(code: int | None) -> str:
-    if code is None:
-        return ""
-    try:
-        val = int(code)
-    except Exception:
-        return ""
-    return ERROR_CATALOGUE.get(val, ERROR_CATALOGUE.get(val & 0xFFFFFFFF, "Unknown error"))
 
 
 def _fmt_dt(val) -> str:
     if val is None:
         return "—"
-    if isinstance(val, str):
-        try:
-            val = datetime.fromisoformat(val.replace("Z", "+00:00"))
-        except Exception:
-            return val
-    try:
+    if hasattr(val, "strftime"):
         return val.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return str(val)
+    return str(val)[:19]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KPI cards
+# KPI summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_app_monitoring_kpis() -> dict[str, Any]:
     """
-    Returns top-level counters for the KPI cards.
+    Top-level KPI numbers for the App Monitoring overview.
+    All install_state comparisons are case-insensitive and handle Graph API
+    variant spellings (e.g. 'success' == 'installed' for winGetApp).
     """
     with session_scope() as db:
         total_apps = db.query(func.count(App.id)).scalar() or 0
 
-        # Apps that have at least one install record
-        apps_with_data = db.query(func.count(DeviceAppStatus.app_id.distinct())).scalar() or 0
+        apps_with_data = (
+            db.query(func.count(DeviceAppStatus.app_id.distinct())).scalar() or 0
+        )
 
+        # ── state counts (case-insensitive via func.lower) ────────────────────
         installed = (
             db.query(func.count(DeviceAppStatus.id))
-            .filter(DeviceAppStatus.install_state == "installed")
+            .filter(func.lower(DeviceAppStatus.install_state).in_(_INSTALLED_STATES))
             .scalar() or 0
         )
         failed = (
             db.query(func.count(DeviceAppStatus.id))
-            .filter(DeviceAppStatus.install_state == "failed")
+            .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
             .scalar() or 0
         )
         pending = (
             db.query(func.count(DeviceAppStatus.id))
-            .filter(DeviceAppStatus.install_state.in_(["pendingInstall", "pendinginstall"]))
+            .filter(func.lower(DeviceAppStatus.install_state).in_(_PENDING_STATES))
             .scalar() or 0
         )
         not_installed = (
             db.query(func.count(DeviceAppStatus.id))
-            .filter(DeviceAppStatus.install_state.in_(["notInstalled", "notinstalled"]))
+            .filter(func.lower(DeviceAppStatus.install_state).in_(_NOT_INSTALLED_STATES))
             .scalar() or 0
         )
         total_records = (
             db.query(func.count(DeviceAppStatus.id)).scalar() or 0
         )
 
-        # Apps with ≥1 failure
         apps_with_failures = (
             db.query(func.count(DeviceAppStatus.app_id.distinct()))
-            .filter(DeviceAppStatus.install_state == "failed")
+            .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
             .scalar() or 0
         )
 
-        # Devices with ≥1 failure
         devices_with_failures = (
             db.query(func.count(DeviceAppStatus.device_id.distinct()))
-            .filter(DeviceAppStatus.install_state == "failed")
+            .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
             .scalar() or 0
         )
 
         install_rate = round((installed / total_records * 100), 1) if total_records else 0
 
     return {
-        "total_apps": total_apps,
-        "apps_with_data": apps_with_data,
-        "total_records": total_records,
-        "installed": installed,
-        "failed": failed,
-        "pending": pending,
-        "not_installed": not_installed,
-        "apps_with_failures": apps_with_failures,
+        "total_apps":           total_apps,
+        "apps_with_data":       apps_with_data,
+        "total_records":        total_records,
+        "installed":            installed,
+        "failed":               failed,
+        "pending":              pending,
+        "not_installed":        not_installed,
+        "apps_with_failures":   apps_with_failures,
         "devices_with_failures": devices_with_failures,
-        "install_rate": install_rate,
+        "install_rate":         install_rate,
     }
 
 
@@ -173,6 +192,7 @@ def get_app_install_summary() -> list[dict]:
     """
     One row per app showing installed / failed / pending / not_installed counts
     and a success rate percentage.
+    State keys are normalised to lower-case and bucketed using _*_STATES constants.
     """
     with session_scope() as db:
         apps = db.query(App).order_by(App.display_name).all()
@@ -185,30 +205,32 @@ def get_app_install_summary() -> list[dict]:
                 .group_by(DeviceAppStatus.install_state)
                 .all()
             )
+            # normalise to lower-case keys
             counts: dict[str, int] = {}
             for state, cnt in statuses:
-                counts[str(state).lower()] = cnt
+                counts[str(state or "unknown").lower()] = cnt
 
-            installed    = counts.get("installed", 0)
-            failed       = counts.get("failed", 0)
-            pending      = counts.get("pendinginstall", 0) + counts.get("pending", 0)
-            not_inst     = counts.get("notinstalled", 0) + counts.get("not installed", 0)
+            # bucket using the same canonical lists
+            installed    = sum(counts.get(s, 0) for s in _INSTALLED_STATES)
+            failed       = sum(counts.get(s, 0) for s in _FAILED_STATES)
+            pending      = sum(counts.get(s, 0) for s in _PENDING_STATES)
+            not_inst     = sum(counts.get(s, 0) for s in _NOT_INSTALLED_STATES)
             total        = sum(counts.values())
             success_rate = round(installed / total * 100, 1) if total else None
 
             result.append({
-                "id":           app.id,
-                "display_name": app.display_name or "—",
-                "app_type":     app.app_type or "—",
-                "publisher":    app.publisher or "—",
-                "installed":    installed,
-                "failed":       failed,
-                "pending":      pending,
+                "id":            app.id,
+                "display_name":  app.display_name or "—",
+                "app_type":      app.app_type or "—",
+                "publisher":     app.publisher or "—",
+                "installed":     installed,
+                "failed":        failed,
+                "pending":       pending,
                 "not_installed": not_inst,
                 "total_devices": total,
-                "success_rate": f"{success_rate}%" if success_rate is not None else "—",
+                "success_rate":  f"{success_rate}%" if success_rate is not None else "—",
                 "last_modified": _fmt_dt(app.last_modified_datetime),
-                "is_assigned":  "Yes" if app.is_assigned else "No",
+                "is_assigned":   "Yes" if app.is_assigned else "No",
             })
 
         return result
@@ -226,7 +248,12 @@ def get_all_install_records(
     """
     Flat device × app × state table.
     Optional filters: state_filter='failed', app_id_filter='<guid>'.
+    Filter is case-insensitive (ilike).
     """
+    logger.info(
+        f"Install log query: state_filter={state_filter!r} "
+        f"app_id_filter={app_id_filter!r} limit={limit}"
+    )
     with session_scope() as db:
         q = (
             db.query(DeviceAppStatus, App, Device)
@@ -256,11 +283,11 @@ def get_all_install_records(
                 "error_code":   _hex(das.error_code),
                 "error_desc":   _err_desc(das.error_code),
                 "last_sync":    _fmt_dt(das.last_sync_date_time),
-                # hidden keys for export / drill-down
                 "_app_id":      das.app_id,
                 "_device_id":   das.device_id,
                 "_error_code_raw": das.error_code,
             })
+        logger.info(f"Install log query: {len(result)} records returned")
         return result
 
 
@@ -270,6 +297,7 @@ def get_all_install_records(
 
 def get_device_installs_for_app(app_id: str) -> list[dict]:
     """All device install records for a specific app, with device metadata."""
+    logger.info(f"Drill-down: loading device installs for app_id={app_id}")
     with session_scope() as db:
         rows = (
             db.query(DeviceAppStatus, Device)
@@ -294,7 +322,8 @@ def get_device_installs_for_app(app_id: str) -> list[dict]:
                 "_device_id":    das.device_id,
                 "_error_code_raw": das.error_code,
             })
-        return result
+    logger.info(f"Drill-down: {len(result)} records returned for app_id={app_id}")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -314,7 +343,7 @@ def get_app_error_analysis() -> list[dict]:
                 func.count(DeviceAppStatus.app_id.distinct()).label("app_count"),
             )
             .filter(
-                DeviceAppStatus.install_state == "failed",
+                func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES),
                 DeviceAppStatus.error_code.isnot(None),
                 DeviceAppStatus.error_code != 0,
             )
@@ -326,13 +355,12 @@ def get_app_error_analysis() -> list[dict]:
 
         result = []
         for code, device_count, app_count in rows:
-            # Get top 3 affected apps for this error
             affected_apps = (
                 db.query(App.display_name)
                 .join(DeviceAppStatus, DeviceAppStatus.app_id == App.id)
                 .filter(
                     DeviceAppStatus.error_code == code,
-                    DeviceAppStatus.install_state == "failed",
+                    func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES),
                 )
                 .group_by(App.id)
                 .order_by(desc(func.count(DeviceAppStatus.id)))
@@ -342,12 +370,12 @@ def get_app_error_analysis() -> list[dict]:
             app_names = ", ".join(r[0] for r in affected_apps if r[0])
 
             result.append({
-                "error_code":    _hex(code),
-                "description":   _err_desc(code),
-                "device_count":  device_count,
-                "app_count":     app_count,
-                "affected_apps": app_names or "—",
-                "severity":      _severity(code),
+                "error_code":      _hex(code),
+                "description":     _err_desc(code),
+                "device_count":    device_count,
+                "app_count":       app_count,
+                "affected_apps":   app_names or "—",
+                "severity":        _severity(code),
                 "_error_code_raw": code,
             })
         return result
@@ -375,7 +403,10 @@ def _severity(code: int | None) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_install_state_distribution() -> list[dict]:
-    """Returns [{state, count}] sorted descending — used for the overview bar."""
+    """
+    Returns [{state, count}] sorted descending — used for the overview bar.
+    Normalises 'success' → 'installed' so the bar colours map correctly.
+    """
     with session_scope() as db:
         rows = (
             db.query(DeviceAppStatus.install_state, func.count(DeviceAppStatus.id))
@@ -383,4 +414,26 @@ def get_install_state_distribution() -> list[dict]:
             .order_by(desc(func.count(DeviceAppStatus.id)))
             .all()
         )
-        return [{"state": (r[0] or "unknown"), "count": r[1]} for r in rows]
+
+    # Normalise variant state names for consistent display
+    _NORM_MAP = {
+        "success":        "installed",
+        "installfailed":  "failed",
+        "uninstallfailed": "failed",
+        "not installed":  "notInstalled",
+        "notapplicable":  "notInstalled",
+        "pending":        "pendingInstall",
+        "downloading":    "pendingInstall",
+        "installing":     "pendingInstall",
+    }
+
+    merged: dict[str, int] = {}
+    for raw_state, cnt in rows:
+        state = (raw_state or "unknown").strip()
+        normalised = _NORM_MAP.get(state.lower(), state)
+        merged[normalised] = merged.get(normalised, 0) + cnt
+
+    return [
+        {"state": s, "count": c}
+        for s, c in sorted(merged.items(), key=lambda x: -x[1])
+    ]

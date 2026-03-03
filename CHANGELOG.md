@@ -10,6 +10,136 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.5] — 2026-03-03
+
+### Fixed
+- **Only 3 apps visible — root cause confirmed**: The fix in v1.2.4 (removing
+  `$select`) was necessary but not sufficient. The **v1.0** `/mobileApps`
+  endpoint silently drops `winGetApp`, `officeSuiteApp`, and other modern app
+  types in some tenant configurations regardless of `$select` usage.
+  `sync_apps()` now calls `get_paged(MOBILE_APPS, api_version="beta")` which
+  returns the full polymorphic collection in all tenant configurations.
+- **Verbose per-app logging**: every app returned by Graph is now logged at
+  INFO level with its OData type and display name before upsert, so any
+  missing types are immediately visible in `app_ops.log` without DEBUG mode.
+
+### Added
+- **`diagnose_apps.py`** — standalone diagnostic script (run from repo root).
+  Authenticates using the same device-code flow as the main app and:
+  - Queries `/mobileApps` with both v1.0 and beta, printing type counts for
+    each so the v1.0 vs beta difference is directly observable.
+  - Probes `/deviceStatuses` and `/deviceInstallStates` for every app and
+    prints the HTTP result and first record (if any), confirming whether
+    Graph has install tracking data for the tenant.
+  - Verifies token identity via the `/me` endpoint.
+
+### Notes
+- If `diagnose_apps.py` shows HTTP 400 on all install-status endpoints for all
+  apps, Graph genuinely has no per-device tracking data yet. This occurs when:
+  (a) apps were recently deployed and devices haven't checked in since, or
+  (b) the tenant's Graph API doesn't expose install tracking for these app types
+      (known limitation for certain app types like `windowsMicrosoftEdgeApp`).
+  In this case the App Ops status counters will remain at 0 until devices
+  check in and Graph populates the tracking data.
+
+---
+
+## [1.2.4] — 2026-03-03
+
+### Fixed
+- **App Ops — only win32 apps visible after sync ("Apps synced: 3" with 7 apps in
+  tenant)** — root cause: `$select` on the polymorphic `/deviceAppManagement/mobileApps`
+  collection caused Graph to silently drop app types whose OData derived schema does
+  not declare all requested fields. `winGetApp`, `officeSuiteApp`, and other types
+  were excluded while `win32LobApp` (which declares `publisher`, `description`, etc.)
+  continued to appear. Fix: `$select` is no longer sent for the `mobileApps` request.
+  `APP_SELECT_FIELDS` in `endpoints.py` is now `None`; `sync_apps()` calls
+  `get_paged(MOBILE_APPS)` with no params so all fields and all app types are returned.
+- **win32LobApp → 400 on `/deviceInstallStates`** — some tenants return
+  `"Resource not found for the segment 'deviceInstallStates'"` for win32 apps
+  despite the type being `win32LobApp` (known Graph behavioural inconsistency).
+  `_sync_win32_statuses()` now automatically falls back to `/deviceStatuses`
+  when a 400 is received, instead of logging a WARNING and giving up.
+- **`windowsMicrosoftEdgeApp` 400 on `/deviceStatuses`** — downgraded from WARNING
+  to DEBUG. Edge is a system-managed app type that does not expose per-device
+  install status; the 400 is expected and informational.
+
+### Changed
+- `APP_SELECT_FIELDS` in `app/graph/endpoints.py` set to `None` with a detailed
+  comment explaining why `$select` must not be used for the mobileApps collection.
+
+---
+
+## [1.2.3] — 2026-03-03
+
+### Fixed
+- **App Ops — all status counters still 0 after sync** — root cause identified:
+  `PRAGMA foreign_keys=ON` is active in `database.py`. When `_sync_device_statuses`
+  / `_sync_win32_statuses` used a **single shared session** for the entire app batch,
+  a single `IntegrityError` (FK violation — `deviceId` not yet in `devices` table)
+  rolled back the whole batch, leaving `DeviceAppStatus` empty.
+  Fixed by moving each record write into its own `session_scope` transaction in
+  `_save_device_app_status()` — FK failures on individual devices no longer affect
+  the rest of the batch.
+- **`windowsMicrosoftEdgeApp`** was missing from `DEVICE_STATUS_SUPPORTED_TYPES`
+  and therefore silently skipped during install-status sync. Added along with
+  `windowsMicrosoftEdgeAppChannel`, `win32CatalogApp`, and `windowsWebApp`.
+- **Install-status errors logged at DEBUG** — meaningful failures (non-400/404
+  Graph errors, DB write errors) were invisible at default INFO level. Upgraded
+  to WARNING so they appear in `collector.log` / `app_ops.log` without requiring
+  DEBUG mode.
+- **Drill-down and Install Log filter returned empty** — downstream symptom of
+  the empty `DeviceAppStatus` table. With the FK-transaction fix above, both
+  features now work correctly once a sync completes.
+
+### Added
+- **`app_ops.log`** — dedicated log file at
+  `%APPDATA%\IntuneDashboard\logs\app_ops.log`.
+  Receives entries from three sources:
+  - `app.ui.pages.app_ops` — KPI refresh, catalog load, drill-down navigation,
+    install log filter, error analysis
+  - `app.analytics.app_monitoring_queries` — SQL query results and record counts
+    for every App Ops data fetch (KPIs, install log, drill-down)
+  - `app.collector.apps` — per-app sync stats (records saved/skipped) and
+    per-record DB errors
+  Follows the same SCCM-style 2 MB rotation as all other logs.
+
+---
+
+## [1.2.2] — 2026-03-03
+
+### Fixed
+- **`GraphClient.test_connection()` AttributeError** — method was not reachable
+  at runtime after auth. Rewrote `client.py` to guarantee the method is always
+  present; `AdminConsentRequiredError` is now re-raised instead of silently caught
+  so the Settings page can surface the consent button correctly.
+- **App Ops — all status counters showed 0** — `get_app_monitoring_kpis()` and
+  `get_app_install_summary()` used exact-case SQL equality (`== "installed"`).
+  Microsoft Graph returns `"success"` for WinGet app installs and may vary
+  capitalisation across app types. All state comparisons are now
+  case-insensitive (`func.lower().in_()`) and include canonical variant spellings:
+  - `"success"` → counted as *installed*
+  - `"installfailed"` / `"uninstallFailed"` → counted as *failed*
+  - `"pending"` / `"downloading"` / `"installing"` → counted as *pending*
+  - `"notApplicable"` / `"excluded"` → counted as *not installed*
+- **`get_install_state_distribution()`** normalises variant state names before
+  building the overview bar, so colours map consistently.
+- **`get_app_error_analysis()`** now uses the same case-insensitive failed-state
+  filter as the KPI query.
+
+### Changed
+- **Log rotation rewritten** (`app/logging_config.py`). Replaced
+  `RotatingFileHandler` (`.log.1 / .log.2` style) with a new
+  `SccmRotatingFileHandler` that mirrors SCCM/ConfigMgr behaviour:
+  - Threshold: **2 MB** per file (down from 10 MB).
+  - On rotation: active log is renamed  `<name>_<YYYY-MM-DD>.log`.
+  - Collision handling: appends `_1`, `_2`, … when today's archive already exists.
+  - Fresh `<name>.log` is opened immediately after rename.
+  - On-disk format: `intune_dashboard_2026-03-03.log`,
+    `intune_dashboard_2026-03-03_1.log`, …
+
+---
+
 ## [1.2.1] — 2026-03-03
 
 ### Removed

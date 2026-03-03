@@ -1,6 +1,7 @@
 """
 Microsoft Graph HTTP client.
 Handles authentication, pagination, retry with backoff, and rate limiting (HTTP 429).
+app/graph/client.py — v1.2.2
 """
 
 import logging
@@ -12,13 +13,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from app.config import GRAPH_BASE_URL_V1, GRAPH_BASE_URL_BETA
-from app.graph.auth import get_auth, AuthError
+from app.graph.auth import get_auth, AuthError, AdminConsentRequiredError
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # seconds base
-PAGE_SIZE = 999  # max allowed by Graph for most endpoints
+PAGE_SIZE = 999    # max allowed by Graph for most endpoints
 
 
 class GraphError(Exception):
@@ -108,6 +109,20 @@ class GraphClient:
                 continue
 
             if resp.status_code == 403:
+                # Check for admin consent required
+                try:
+                    err_body = resp.json().get("error", {})
+                    err_code = err_body.get("code", "")
+                    err_msg  = err_body.get("message", resp.text)
+                    if "AADSTS65001" in err_msg or "consent_required" in err_code.lower():
+                        raise AdminConsentRequiredError(
+                            f"Admin consent required. Grant consent via the Admin Consent "
+                            f"Page in Settings, then retry.\n\nDetail: {err_msg}"
+                        )
+                except AdminConsentRequiredError:
+                    raise
+                except Exception:
+                    pass
                 raise GraphError(
                     f"Access denied (403): {resp.text}. Check app permissions.",
                     status_code=403,
@@ -138,6 +153,10 @@ class GraphClient:
             return resp.json()
 
         raise GraphError(f"Max retries exceeded for {url}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public HTTP helpers
+    # ─────────────────────────────────────────────────────────────────────────
 
     def get(self, endpoint: str, params: Dict | None = None, api_version: str = "v1.0") -> Dict:
         """GET a single resource."""
@@ -207,10 +226,16 @@ class GraphClient:
         """Collect all items from a paged endpoint into a list."""
         return list(self.get_paged(endpoint, params=params, api_version=api_version))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Connection test
+    # ─────────────────────────────────────────────────────────────────────────
+
     def test_connection(self) -> Dict[str, Any]:
         """
-        Test Graph connectivity.
-        Returns dict with 'ok' bool and 'details' string.
+        Test Graph connectivity by fetching the tenant's organization object.
+        Returns dict with:
+          'ok'      — True if the call succeeded
+          'details' — human-readable result string
         """
         try:
             self._ensure_token()
@@ -218,6 +243,8 @@ class GraphClient:
             orgs = data.get("value", [])
             name = orgs[0].get("displayName", "unknown") if orgs else "unknown"
             return {"ok": True, "details": f"Connected to tenant: {name}"}
+        except AdminConsentRequiredError as e:
+            raise  # re-raise so settings_page can show the consent button
         except AuthError as e:
             return {"ok": False, "details": f"Auth error: {e}"}
         except GraphError as e:
@@ -226,7 +253,10 @@ class GraphClient:
             return {"ok": False, "details": f"Unexpected error: {e}"}
 
 
-# Singleton client
+# ─────────────────────────────────────────────────────────────────────────────
+# Singleton helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 _client: Optional[GraphClient] = None
 
 
@@ -238,6 +268,6 @@ def get_client() -> GraphClient:
 
 
 def reset_client():
-    """Reset the client (e.g., after config change)."""
+    """Reset the singleton client (e.g. after config change or sign-out)."""
     global _client
     _client = None

@@ -4,6 +4,8 @@ A local desktop application for Microsoft Intune administrators.
 Connects to Microsoft Graph API, caches data in a local SQLite database,
 and provides a rich UI for device management, policy exploration, and governance.
 
+**Current version: 1.2.4**
+
 ---
 
 ## Features
@@ -85,91 +87,64 @@ python main.py
 - **Cache location**: `%APPDATA%\IntuneDashboard\msal_cache.bin`
 - **Encryption**: DPAPI via msal-extensions (Windows, bound to your user account).
   Falls back to plain JSON if msal-extensions is not installed.
-- **Sign out**: Settings → 🚪 Sign out / Clear Token Cache
-
-### Automatic scope re-authentication
-
-When `DEFAULT_SCOPES` changes between versions, the token cache is automatically
-cleared on next startup and you will be prompted to sign in once with the updated
-permission set. No manual action required.
-
-### Admin consent
-
-If you see a 403 error or AADSTS65001, a Global Administrator must grant consent:
-
-1. Settings → **🔑 Open Admin Consent Page**
-2. Sign in as a Global Administrator and click Accept
-3. Settings → Sign out / Clear Token Cache → re-sync
+- **Sign out**: Settings → *Sign out / Clear Token Cache* removes the cache and
+  forces a fresh device code sign-in on next sync.
+- **Admin consent**: if you see `403 / AADSTS65001`, use
+  Settings → *Open Admin Consent Page* — a Global Administrator must grant consent.
 
 ---
 
-## Portal Deep-links
+## Log Files
 
-All "Open in Intune Portal" context menu actions use the correct portal blade.
-URL construction is centralised in `app/utils/intune_links.py`.
+Logs are written to `%APPDATA%\IntuneDashboard\logs\`.
 
-| Policy type | Blade |
+| File | Content |
 |---|---|
-| Compliance policy | `CompliancePolicyOverview.ReactView` |
-| Settings Catalog / Endpoint Security | `PolicySummaryBlade` |
-| Windows / macOS Update config | `SoftwareUpdatesConfigurationSummaryReportBlade` |
-| Classic config profile | `DeviceConfigurationMenuBlade` |
-| App | `SettingsMenu/~/0` |
-| Device | `DeviceSettingsMenuBlade/~/overview` |
+| `intune_dashboard.log` | Everything (root logger) |
+| `graph.log` | Graph API calls and auth events |
+| `collector.log` | Sync engine and data collectors |
+| `db.log` | Database operations |
+| `ui.log` | UI events |
+| `app_ops.log` | App Ops page: KPI/drill-down/filter queries, per-app sync stats, DB write errors |
+
+**Rotation** (SCCM-style): when a log file reaches **2 MB** it is automatically
+renamed to `<name>_<YYYY-MM-DD>.log` (e.g. `intune_dashboard_2026-03-03.log`) and
+a fresh `<name>.log` is started. If that dated archive already exists, a counter
+is appended: `_1`, `_2`, etc.
 
 ---
 
-## Database Migration
+## Data Storage
 
-The app automatically migrates existing databases on startup:
-
-- **`outcomes` table**: dropped and recreated if the v1.0 schema is detected.
-- **`remediations` table**: dropped automatically on first startup after v1.2.1
-  upgrade (orphaned table from the removed Remediations feature).
-- **Other tables**: additive `ALTER TABLE` migrations (non-destructive).
-
-To start fresh: delete `%APPDATA%\IntuneDashboard\intune_dashboard.db` and restart.
-
----
-
-## Troubleshooting
-
-**Device code dialog does not appear**
-
-Ensure `Auth Mode` is set to `device_code` in Settings. If the token cache is
-already valid, no dialog is needed. Use "Sign out / Clear Token Cache" to force
-a new sign-in.
-
-**`no such column: outcomes.status` error**
-
-Your database was created with v1.0. The migration runs automatically on startup —
-just restart the app.
-
-**403 error on sync**
-
-Verify all required permissions are granted with admin consent in Entra.
-Then: Settings → Sign out / Clear Token Cache → Sync Now.
-
-**Log files** — all logs in `%APPDATA%\IntuneDashboard\logs\`
-
-| File | Contents |
+| Path | Content |
 |---|---|
-| `intune_dashboard.log` | Root logger |
-| `graph.log` | HTTP client — rate limiting, 401/403, retries |
-| `collector.log` | Sync steps — per-item details |
-| `db.log` | Database layer |
+| `%APPDATA%\IntuneDashboard\intune_dashboard.db` | Local SQLite cache |
+| `%APPDATA%\IntuneDashboard\msal_cache.bin` | Encrypted MSAL token cache |
+| `%APPDATA%\IntuneDashboard\config.json` | Application settings |
+| `%APPDATA%\IntuneDashboard\exports\` | CSV / JSON / PDF exports |
 
 ---
 
-## Unit Tests
+## Demo Mode
+
+Enable **Demo Mode** in Settings to explore the UI without real credentials.
+A synthetic dataset of devices, policies, and apps is loaded from
+`app/demo/demo_data.py`. Disable before connecting to a real tenant.
+
+---
+
+## Running Tests
 
 ```bash
-python tests/test_intune_links.py      # self-contained, no pytest required
-python -m pytest tests/ -v
+pytest tests/ -v
 ```
 
 ---
 
-## Version History
+## Building a Standalone Executable
 
-See [CHANGELOG.md](CHANGELOG.md).
+```bash
+pyinstaller intune_dashboard.spec
+```
+
+Output in `dist/IntuneDashboard/`.

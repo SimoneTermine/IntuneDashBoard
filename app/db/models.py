@@ -1,16 +1,23 @@
 """
 Database models for Intune Dashboard.
 Unified model: Control → Assignment → Outcome per device.
-v1.2.1: Removed Remediation model (Proactive Remediations feature removed).
+
+v1.2.1: Removed Remediation model.
+v1.2.2: DeviceAppStatus.device_id is now a plain indexed String — no FK constraint.
+        The deviceId returned by Graph /mobileApps/{id}/deviceStatuses is not
+        guaranteed to match the Intune managed device ID stored in devices.id.
+        Removing the FK allows all install status records to be persisted.
+        Joins to Device are done as LEFT OUTER JOINs on device_name/device_id
+        where available.
 """
 
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    Column, String, Integer, Boolean, DateTime, Text, Float,
-    ForeignKey, Index, JSON, create_engine, event
+    Column, String, Integer, Boolean, DateTime, Text,
+    ForeignKey, Index,
 )
-from sqlalchemy.orm import DeclarativeBase, relationship, Session
+from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.sql import func
 
 
@@ -39,7 +46,7 @@ class Device(Base):
     user_principal_name = Column(String, index=True)
     user_display_name = Column(String)
     user_id = Column(String)
-    azure_ad_device_id = Column(String)
+    azure_ad_device_id = Column(String, index=True)
     enroll_profile = Column(String)
     model = Column(String)
     manufacturer = Column(String)
@@ -53,15 +60,17 @@ class Device(Base):
     synced_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
 
-    compliance_statuses = relationship("DeviceComplianceStatus", back_populates="device", cascade="all, delete-orphan")
-    app_statuses = relationship("DeviceAppStatus", back_populates="device", cascade="all, delete-orphan")
+    compliance_statuses = relationship(
+        "DeviceComplianceStatus", back_populates="device", cascade="all, delete-orphan"
+    )
+    # NOTE: no app_statuses relationship here — DeviceAppStatus.device_id has no FK
 
     def __repr__(self):
         return f"<Device {self.device_name} ({self.id[:8]}...)>"
 
 
 # ---------------------------------------------------------------------------
-# Control (Policy / App / Script)
+# Control (Policy)
 # ---------------------------------------------------------------------------
 class Control(Base):
     """Unified entity: any Intune object that applies settings/state to devices."""
@@ -92,15 +101,15 @@ class Control(Base):
 # Assignment
 # ---------------------------------------------------------------------------
 class Assignment(Base):
-    """Represents a Graph assignment: control → group/allDevices."""
+    """Binding between a Control and a target (group/user/device/all)."""
     __tablename__ = "assignments"
 
     id = Column(String, primary_key=True)
     control_id = Column(String, ForeignKey("controls.id", ondelete="CASCADE"), index=True)
-    target_type = Column(String)        # group / allDevices / allUsers / configManagerCollection
+    target_type = Column(String)
     target_id = Column(String, index=True)
     target_display_name = Column(String)
-    intent = Column(String, default="include")  # include / exclude
+    intent = Column(String, default="include")
     filter_id = Column(String)
     filter_type = Column(String)
     raw_json = Column(Text)
@@ -128,6 +137,7 @@ class Group(Base):
     membership_rule = Column(Text)
     membership_rule_processing_state = Column(String)
     member_count = Column(Integer)
+    is_dynamic = Column(Boolean, default=False)
     raw_json = Column(Text)
     synced_at = Column(DateTime, default=func.now())
 
@@ -170,25 +180,35 @@ class App(Base):
     raw_json = Column(Text)
     synced_at = Column(DateTime, default=func.now())
 
-    device_statuses = relationship("DeviceAppStatus", back_populates="app", cascade="all, delete-orphan")
+    device_statuses = relationship(
+        "DeviceAppStatus", back_populates="app", cascade="all, delete-orphan"
+    )
 
 
 class DeviceAppStatus(Base):
-    """Per-device installation status of an app."""
+    """
+    Per-device installation status of an app.
+
+    IMPORTANT — device_id has NO FK constraint.
+    The 'deviceId' field returned by Graph /mobileApps/{id}/deviceStatuses
+    is the AAD Device Object ID, which differs from the Intune Managed Device
+    ID stored in devices.id. Enforcing a FK here would cause every insert to
+    fail silently. Joins to Device are performed on device_name or azure_ad_device_id
+    where needed.
+    """
     __tablename__ = "device_app_statuses"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    device_id = Column(String, ForeignKey("devices.id", ondelete="CASCADE"), index=True)
+    device_id = Column(String, index=True)          # NO ForeignKey — see docstring
     app_id = Column(String, ForeignKey("apps.id", ondelete="CASCADE"), index=True)
     install_state = Column(String)
     error_code = Column(Integer)
     last_sync_date_time = Column(DateTime)
-    device_name = Column(String)
+    device_name = Column(String, index=True)
     user_name = Column(String)
     raw_json = Column(Text)
     synced_at = Column(DateTime, default=func.now())
 
-    device = relationship("Device", back_populates="app_statuses")
     app = relationship("App", back_populates="device_statuses")
 
     __table_args__ = (
@@ -197,7 +217,7 @@ class DeviceAppStatus(Base):
 
 
 # ---------------------------------------------------------------------------
-# Snapshot (for drift detection)
+# Snapshot
 # ---------------------------------------------------------------------------
 class Snapshot(Base):
     """Point-in-time snapshot of tenant metadata for drift detection."""
@@ -250,7 +270,7 @@ class DeviceComplianceStatus(Base):
 
 
 # ---------------------------------------------------------------------------
-# Outcome (Explainability engine)
+# Outcome
 # ---------------------------------------------------------------------------
 class Outcome(Base):
     """Observed or inferred state of a Control applied to a Device."""
@@ -291,7 +311,10 @@ class DriftReport(Base):
     report_json = Column(Text)
 
     def __repr__(self):
-        return f"<DriftReport baseline={self.baseline_snapshot_id} current={self.current_snapshot_id}>"
+        return (
+            f"<DriftReport baseline={self.baseline_snapshot_id} "
+            f"current={self.current_snapshot_id}>"
+        )
 
 
 # ---------------------------------------------------------------------------

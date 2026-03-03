@@ -297,7 +297,15 @@ class MSALAuth:
         • openid / profile / offline_access are always skipped (OIDC internals).
         """
         _OIDC = {"openid", "profile", "offline_access", "email"}
-        granted = set((token_result.get("scope") or "").lower().split())
+
+        # MSAL may return scopes as full URIs OR short names — normalise both.
+        # e.g. "https://graph.microsoft.com/DeviceManagementApps.Read.All"
+        #   → also adds "devicemanagementapps.read.all" to the granted set.
+        raw_granted = (token_result.get("scope") or "").lower().split()
+        granted: set[str] = set()
+        for s in raw_granted:
+            granted.add(s)
+            granted.add(s.split("/")[-1])   # last path segment = short permission name
 
         for scope in requested_scopes:
             name = scope.split("/")[-1].lower()
@@ -310,7 +318,7 @@ class MSALAuth:
                 prefix = name[: -len(".read.all")]
                 if f"{prefix}.readwrite.all" in granted:
                     continue
-            logger.debug(f"Scope check: '{name}' not satisfied by granted={granted}")
+            logger.debug(f"Scope check: '{name}' not satisfied by granted={sorted(granted)}")
             return False
         return True
 

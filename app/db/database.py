@@ -2,14 +2,10 @@
 Database initialization and session factory.
 Uses SQLAlchemy 2.x with SQLite.
 
-On startup, _migrate_db() checks for schema changes in tables that have
-been restructured across versions and performs the minimum ALTER/DROP+CREATE
-needed to bring the existing DB up to date without losing data.
-
-Tables that are safe to drop+recreate (fully derived from Graph data):
-  - outcomes  (rebuilt by compliance_status collector on every sync)
-
-v1.2.1: Removed remediations table reference.
+v1.2.2: Added migration to drop and recreate device_app_statuses table —
+        the old schema had a FK constraint on device_id which caused all
+        insert attempts to fail silently (Graph returns AAD Device IDs,
+        not Intune Managed Device IDs).
 """
 
 import logging
@@ -62,7 +58,7 @@ def init_db(db_path: str | None = None):
 
 
 def _get_columns(engine, table_name: str) -> set[str]:
-    """Return the set of column names for a table, or empty set if table doesn't exist."""
+    """Return column names for a table, or empty set if table doesn't exist."""
     try:
         insp = inspect(engine)
         if table_name not in insp.get_table_names():
@@ -73,31 +69,53 @@ def _get_columns(engine, table_name: str) -> set[str]:
         return set()
 
 
+def _table_has_fk(engine, table_name: str, target_table: str) -> bool:
+    """Return True if table has a FK constraint pointing to target_table."""
+    try:
+        insp = inspect(engine)
+        if table_name not in insp.get_table_names():
+            return False
+        fks = insp.get_foreign_keys(table_name)
+        return any(fk.get("referred_table") == target_table for fk in fks)
+    except Exception as e:
+        logger.debug(f"_table_has_fk({table_name}) failed: {e}")
+        return False
+
+
 def _migrate_db(engine) -> None:
     """
     Run schema migrations for existing databases.
-
-    Strategy per table:
-      - outcomes:     derived data → drop and recreate if schema is outdated
-      - remediations: orphaned table from v1.1.x — drop silently if present
-      - drift_reports: new table → create_all handles it; no migration needed
     """
     with engine.begin() as conn:
 
         # ── outcomes ────────────────────────────────────────────────────────
+        # v1.0 schema missing 'status' column — safe to drop (derived data).
         cols = _get_columns(engine, "outcomes")
         if cols and "status" not in cols:
             logger.warning(
-                "outcomes table has outdated schema (missing 'status' column). "
-                "Dropping and recreating — all data will be rebuilt on next sync."
+                "outcomes: outdated schema detected — dropping and recreating."
             )
             conn.execute(text("PRAGMA foreign_keys=OFF"))
             conn.execute(text("DROP TABLE IF EXISTS outcomes"))
             conn.execute(text("PRAGMA foreign_keys=ON"))
-            logger.info("outcomes table dropped — will be recreated by create_all()")
 
-        # ── remediations ────────────────────────────────────────────────────
-        # Feature removed in v1.2.1 — drop the orphaned table if it exists.
+        # ── device_app_statuses ─────────────────────────────────────────────
+        # v1.2.1 and earlier had a FK constraint on device_id → devices.id.
+        # This caused every insert to fail silently because Graph returns
+        # AAD Device IDs (not Intune Managed Device IDs) in /deviceStatuses.
+        # The table is fully derived — safe to drop and recreate.
+        if _table_has_fk(engine, "device_app_statuses", "devices"):
+            logger.warning(
+                "device_app_statuses: FK constraint on device_id detected — "
+                "dropping and recreating table. Install status data will be "
+                "repopulated on next sync."
+            )
+            conn.execute(text("PRAGMA foreign_keys=OFF"))
+            conn.execute(text("DROP TABLE IF EXISTS device_app_statuses"))
+            conn.execute(text("PRAGMA foreign_keys=ON"))
+            logger.info("device_app_statuses dropped — will be recreated by create_all()")
+
+        # ── remediations (orphaned from v1.1.x) ─────────────────────────────
         insp = inspect(engine)
         if "remediations" in insp.get_table_names():
             conn.execute(text("PRAGMA foreign_keys=OFF"))
@@ -105,8 +123,9 @@ def _migrate_db(engine) -> None:
             conn.execute(text("PRAGMA foreign_keys=ON"))
             logger.info("remediations table dropped (feature removed in v1.2.1)")
 
-        # ── Add missing columns (non-destructive) ───────────────────────────
-        _add_column_if_missing(conn, "device_compliance_status", "user_principal_name", "TEXT")
+        # ── Additive ALTER TABLE migrations (non-destructive) ───────────────
+        _add_column_if_missing(conn, "device_compliance_status",
+                               "user_principal_name", "TEXT")
         _add_column_if_missing(conn, "controls", "api_source", "TEXT")
         _add_column_if_missing(conn, "controls", "is_assigned", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "controls", "assignment_count", "INTEGER DEFAULT 0")
@@ -118,7 +137,7 @@ def _migrate_db(engine) -> None:
 
 
 def _add_column_if_missing(conn, table: str, column: str, col_type: str) -> None:
-    """Add a column to a table if it doesn't already exist. No-op if table doesn't exist."""
+    """Add a column if it doesn't already exist. No-op if table doesn't exist."""
     try:
         cols = {
             row[1]
@@ -138,7 +157,6 @@ def get_engine():
 
 
 def get_session() -> Session:
-    """Return a new database session. Caller must close it."""
     if _SessionFactory is None:
         init_db()
     return _SessionFactory()

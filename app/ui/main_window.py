@@ -250,7 +250,100 @@ class MainWindow(QMainWindow):
         self._sync_worker = SyncWorker()
         self._sync_worker.finished.connect(self._on_sync_finished)
         self._sync_worker.progress.connect(self._on_sync_progress)
+        # ── NEW: show device-code dialog if auth is needed during sync ──────
+        self._sync_worker.device_code_ready.connect(self._on_device_code_needed)
         self._sync_worker.start()
+        
+        # ── NEW METHOD — add after run_sync ──────────────────────────────────────
+
+    def _on_device_code_needed(self, user_code: str, uri: str):
+        """
+        Called (via Qt signal, always in main thread) when a sync requires
+        interactive authentication.  Shows the device-code dialog so the user
+        can sign in without leaving the app.
+        """
+        self._show_device_code_dialog(user_code, uri)
+
+    def _show_device_code_dialog(self, user_code: str, uri: str):
+        """
+        Non-blocking device-code dialog.  The sync continues waiting in the
+        background thread; this dialog just gives the user the code + URL.
+        It closes automatically when the sync worker emits finished().
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+            QPushButton, QFrame, QApplication,
+        )
+        from PySide6.QtCore import Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Sign in to Microsoft")
+        dlg.setMinimumWidth(480)
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(12)
+        lay.setContentsMargins(24, 20, 24, 20)
+
+        lay.addWidget(QLabel(
+            "<b>Authentication required — open the URL below and enter the code:</b>"
+        ))
+
+        url_lbl = QLabel(f'<a href="{uri}" style="color:#89dceb">{uri}</a>')
+        url_lbl.setOpenExternalLinks(True)
+        url_lbl.setTextInteractionFlags(
+            Qt.TextBrowserInteraction | Qt.TextSelectableByMouse
+        )
+        lay.addWidget(url_lbl)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #45475a;")
+        lay.addWidget(sep)
+
+        lay.addWidget(QLabel("Your sign-in code:"))
+
+        code_lbl = QLabel(
+            f'<span style="font-size:32px;font-weight:bold;'
+            f'letter-spacing:6px;color:#cba6f7">{user_code}</span>'
+        )
+        code_lbl.setAlignment(Qt.AlignCenter)
+        code_lbl.setTextFormat(Qt.RichText)
+        lay.addWidget(code_lbl)
+
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("📋  Copy Code")
+        copy_btn.setMinimumHeight(32)
+
+        def _copy():
+            QApplication.clipboard().setText(user_code)
+            copy_btn.setText("✅  Copied!")
+
+        copy_btn.clicked.connect(_copy)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch()
+
+        dismiss_btn = QPushButton("Dismiss")
+        dismiss_btn.setMinimumHeight(32)
+        dismiss_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(dismiss_btn)
+        lay.addLayout(btn_row)
+
+        note = QLabel(
+            "<i>This dialog can be dismissed — the sync will keep waiting for "
+            "your sign-in in the background.</i>"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6c7086; font-size: 10px;")
+        lay.addWidget(note)
+
+        # Auto-close when sync finishes
+        if self._sync_worker:
+            self._sync_worker.finished.connect(dlg.accept)
+
+        dlg.show()   # non-blocking (show, not exec)
+        
+        # ──────────────────────────────────────
 
     def _on_sync_progress(self, msg: str):
         self._status_bar.showMessage(f"Sync: {msg}")
