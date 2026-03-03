@@ -10,6 +10,30 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.7] — 2026-03-03
+
+### Fixed
+- **App Ops install status counters still 0 — root cause confirmed**: `/deviceStatuses`
+  and `/deviceInstallStates` were called with a `$select` parameter listing specific
+  fields (`displayVersion`, `userPrincipalName`, `userName`, etc.). These endpoints
+  are polymorphic sub-resources — each app type has a different OData derived schema.
+  Graph returns HTTP 400 `"InvalidQueryParameter"` / `"Bad Request"` when any
+  requested field is not declared in the derived schema for that app type.
+  This is the same issue that caused missing apps in v1.2.4 on the `mobileApps`
+  collection; it also affects the install-status sub-endpoints.
+
+  Fix: `$select` removed from both `_sync_device_statuses()` and
+  `_sync_win32_statuses()`. Graph now returns all available fields for every
+  app type.
+
+- **400 errors logged without the actual Graph message**: the `except GraphError`
+  handler for 400s previously logged a hardcoded `"device check-in pending"`
+  message instead of the real Graph error. Now logs `e.raw` (the full response
+  body) so the actual `errorCode` and `message` from Graph are visible in
+  `app_ops.log`.
+
+---
+
 ## [1.2.6] -- 2026-03-03
 
 ### Fixed

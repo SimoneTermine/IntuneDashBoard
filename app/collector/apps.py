@@ -1,17 +1,23 @@
 """
-app/collector/apps.py  —  v1.2.5
+app/collector/apps.py  —  v1.2.7
 
 Collector for Intune managed apps and per-device install status.
 
-Key changes in v1.2.5:
-  - mobileApps synced via BETA API (v1.0 silently excludes winGetApp /
-    officeSuiteApp / windowsMicrosoftEdgeApp in some tenant configurations).
-  - Verbose per-app logging: every app returned by Graph is logged with its
-    OData type BEFORE upsert, so missing types are visible in app_ops.log.
-  - win32LobApp /deviceInstallStates 400 → automatic fallback to /deviceStatuses.
-  - HTTP 400 on install status endpoints downgraded to INFO (expected for
-    newly deployed apps or devices that haven't checked in yet).
-  - Per-record session_scope so FK violations never roll back the whole batch.
+v1.2.7:
+  - Removed $select from /deviceStatuses and /deviceInstallStates calls.
+    Same root cause as the mobileApps $select fix (v1.2.4/1.2.5): these
+    are polymorphic sub-resources and Graph returns HTTP 400
+    "InvalidQueryParameter" / "Bad request" when any requested field is not
+    declared in the OData derived type schema for that app type.
+    Requesting all fields (no $select) works for every app type.
+  - 400 responses now log e.raw (the actual Graph error message) so the real
+    reason is visible in app_ops.log instead of the generic
+    "device check-in pending" assumption.
+
+Previous fixes (kept):
+  - mobileApps synced via BETA API (v1.2.5)
+  - win32LobApp /deviceInstallStates 400 -> fallback to /deviceStatuses (v1.2.4)
+  - per-record session_scope for FK-safe writes (v1.2.3)
 """
 
 import json
@@ -24,8 +30,8 @@ from app.db.models import App, DeviceAppStatus
 from app.graph.client import GraphClient, GraphError
 from app.graph.endpoints import (
     MOBILE_APPS,
-    APP_DEVICE_STATUSES,
-    APP_WIN32_INSTALL_STATES,
+    APP_STATUS_OVERVIEW_REPORT,
+    APP_DEVICE_INSTALL_STATUS_REPORT,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,14 +92,14 @@ class AppCollector:
         Sync all mobileApps from Graph using the BETA endpoint.
 
         Why beta?
-          The v1.0 /mobileApps collection silently drops certain modern app types
-          (winGetApp, officeSuiteApp, windowsMicrosoftEdgeApp) in some tenant
-          configurations. The beta endpoint returns the full polymorphic collection.
+          The v1.0 /mobileApps collection silently drops certain modern app
+          types (winGetApp, officeSuiteApp, windowsMicrosoftEdgeApp) in some
+          tenant configurations.
 
         Why no $select?
-          Using $select on a polymorphic collection causes Graph to silently omit
-          any app type whose OData derived schema does not declare all requested
-          fields. No $select = all app types guaranteed.
+          Using $select on a polymorphic collection causes Graph to silently
+          omit app types whose OData derived schema does not declare all
+          requested fields.
         """
         logger.info("Syncing apps — BETA API, no $select (all types)...")
         count = 0
@@ -105,7 +111,6 @@ class AppCollector:
             app_type = odata.split(".")[-1].replace("#", "") if odata else "unknown"
             name     = raw.get("displayName", "?")
 
-            # Verbose: log every app received from Graph so missing types are visible
             logger.info(f"  Graph app: [{app_type}] {name!r} ({app_id[:8]}...)")
 
             try:
@@ -152,19 +157,16 @@ class AppCollector:
         """
         Best-effort: fetch per-device install status for all supported app types.
 
-        HTTP 400 on all status endpoints means Graph has no tracking data yet —
-        typical for newly deployed apps where devices have not yet checked in.
-
-        Each record is committed in its own session_scope so a single FK
-        violation (deviceId not yet in devices table) never rolls back the
-        entire batch for an app.
+        No $select is used on either endpoint — the sub-resources are polymorphic
+        too and $select causes 400 "InvalidQueryParameter" when a field is not
+        declared in the derived type schema.
         """
-        logger.info("Syncing app device install statuses (best-effort)...")
+        logger.info("Syncing app install statuses (type-cast URLs, beta)...")
 
         with session_scope() as db:
             apps = [(a.id, a.app_type or "") for a in db.query(App).all()]
 
-        attempted    = 0
+        attempted     = 0
         no_data_apps: list[str] = []
         skipped_types: set[str] = set()
 
@@ -185,11 +187,10 @@ class AppCollector:
         if no_data_apps:
             logger.info(
                 f"App install statuses: {attempted} attempted — "
-                f"no data from Graph for: {', '.join(no_data_apps)}. "
-                f"Devices may not have checked in yet since last app deployment."
+                f"no records from Graph for: {', '.join(no_data_apps)}."
             )
         else:
-            logger.info(f"App install statuses: {attempted} attempted, all returned data")
+            logger.info(f"App install statuses: {attempted} apps, all returned data")
 
         if skipped_types:
             logger.info(f"Skipped unsupported app types: {sorted(skipped_types)}")
@@ -201,22 +202,23 @@ class AppCollector:
     def _sync_device_statuses(self, app_id: str, app_type: str) -> bool:
         """
         Fetch per-device install status via /deviceStatuses (beta).
+
+        No $select: the /deviceStatuses sub-resource is polymorphic across app
+        types. Requesting specific fields (e.g. displayVersion, userPrincipalName)
+        causes Graph to return HTTP 400 "InvalidQueryParameter" for types that
+        don't declare those fields in their OData schema.
+
         Returns True if Graph returned any records, False otherwise.
         """
         try:
-            endpoint = APP_DEVICE_STATUSES.format(app_id=app_id)
-            statuses = self.client.get_all(
-                endpoint,
-                params={
-                    "$select": "id,deviceId,deviceName,displayVersion,"
-                               "installState,errorCode,lastSyncDateTime,"
-                               "userPrincipalName,userName"
-                },
-                api_version="beta",
-            )
+            endpoint = APP_DEVICE_STATUSES_TYPED.format(app_id=app_id, app_type=app_type)
+            logger.info(f"  {app_type} {app_id[:8]}: GET beta/{endpoint}")
+
+            # No params / no $select — same reason as mobileApps (polymorphic schema)
+            statuses = self.client.get_all(endpoint, api_version="beta")
 
             if not statuses:
-                logger.debug(f"  {app_type} {app_id[:8]}: /deviceStatuses returned 0 records")
+                logger.debug(f"  {app_type} {app_id[:8]}: /deviceStatuses — 0 records")
                 return False
 
             saved = failed = 0
@@ -230,9 +232,9 @@ class AppCollector:
 
         except GraphError as e:
             if e.status_code in (400, 404):
+                raw_detail = f" — Graph: {e.raw}" if e.raw else ""
                 logger.info(
-                    f"  {app_type} {app_id[:8]}: /deviceStatuses HTTP {e.status_code} "
-                    f"(no install data — device check-in pending)"
+                    f"  {app_type} {app_id[:8]}: /deviceStatuses HTTP {e.status_code}{raw_detail}"
                 )
             else:
                 logger.warning(
@@ -245,22 +247,19 @@ class AppCollector:
 
     def _sync_win32_statuses(self, app_id: str, app_type: str) -> bool:
         """
-        Fetch via /deviceInstallStates (Win32/MSI).
-        Falls back to /deviceStatuses on HTTP 400 (known Graph inconsistency).
+        Fetch via /deviceInstallStates (Win32/MSI), no $select.
+        Falls back to /deviceStatuses on HTTP 400.
         Returns True if any records were received, False otherwise.
         """
         try:
-            endpoint = APP_WIN32_INSTALL_STATES.format(app_id=app_id)
-            statuses = self.client.get_all(
-                endpoint,
-                params={
-                    "$select": "id,deviceId,deviceName,installState,errorCode,lastSyncDateTime"
-                },
-                api_version="beta",
-            )
+            endpoint = APP_WIN32_INSTALL_STATES_TYPED.format(app_id=app_id, app_type=app_type)
+            logger.info(f"  {app_type} {app_id[:8]}: GET beta/{endpoint}")
+
+            # No $select — see _sync_device_statuses docstring
+            statuses = self.client.get_all(endpoint, api_version="beta")
 
             if not statuses:
-                logger.debug(f"  {app_type} {app_id[:8]}: /deviceInstallStates returned 0 records")
+                logger.debug(f"  {app_type} {app_id[:8]}: /deviceInstallStates — 0 records")
                 return False
 
             saved = failed = 0
@@ -269,13 +268,14 @@ class AppCollector:
                     saved += 1
                 else:
                     failed += 1
-            logger.info(f"  {app_type} {app_id[:8]}: {saved} saved via /deviceInstallStates, {failed} skipped")
+            logger.info(f"  {app_type} {app_id[:8]}: {saved} saved via /deviceInstallStates")
             return True
 
         except GraphError as e:
             if e.status_code == 400:
+                raw_detail = f" — Graph: {e.raw}" if e.raw else ""
                 logger.info(
-                    f"  {app_type} {app_id[:8]}: /deviceInstallStates 400 — "
+                    f"  {app_type} {app_id[:8]}: /deviceInstallStates 400{raw_detail} — "
                     f"falling back to /deviceStatuses"
                 )
                 return self._sync_device_statuses(app_id, app_type)
@@ -296,8 +296,6 @@ class AppCollector:
         """
         Persist one device-app status record in its own session_scope.
         Returns True on success, False on any error.
-        Each record is independent — a FK violation on one device never
-        rolls back the rest of the batch.
         """
         device_id = raw.get("deviceId", "")
         if not device_id:

@@ -33,12 +33,12 @@ MOBILE_APPS              = "deviceAppManagement/mobileApps"
 APP_ASSIGNMENTS          = "deviceAppManagement/mobileApps/{app_id}/assignments"
 
 # Per-device install status — endpoint differs by app type:
-#   /deviceStatuses      → winGetApp, LOB, Store apps (beta)
-#   /deviceInstallStates → Win32LobApp, windowsMobileMSI (beta)
-#   NOTE: some tenants' win32LobApp apps return 400 on /deviceInstallStates
-#         and must fall back to /deviceStatuses (see apps.py).
-APP_DEVICE_STATUSES      = "deviceAppManagement/mobileApps/{app_id}/deviceStatuses"
-APP_WIN32_INSTALL_STATES = "deviceAppManagement/mobileApps/{app_id}/deviceInstallStates"
+# Type cast obbligatorio: deviceStatuses/deviceInstallStates sono navigation
+# properties dei tipi DERIVATI, non della classe base mobileApp.
+# Senza il cast Graph restituisce 400 "Resource not found for the segment".
+APP_STATUS_OVERVIEW_REPORT       = "deviceManagement/reports/getAppStatusOverviewReport"
+APP_DEVICE_INSTALL_STATUS_REPORT = "deviceManagement/reports/getDeviceInstallStatusReport"
+
 
 # ── Groups ─────────────────────────────────────────────────────────────────
 GROUPS                   = "groups"
