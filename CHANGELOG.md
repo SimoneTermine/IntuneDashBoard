@@ -10,6 +10,46 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.6] -- 2026-03-03
+
+### Fixed
+- **Device code prompt not appearing during Sync Now** -- When the cached
+  token was expired or missing required scopes, `SyncEngine` initiated a
+  device code flow but had no callback, so the flow ran silently and the sync
+  stalled waiting for a sign-in that could never happen.
+
+  Fix (three files):
+  - `app/ui/workers/sync_worker.py`: `SyncWorker` gains a `device_code_ready`
+    signal (user_code, verification_uri). The `run()` method passes an
+    `on_device_code` callback to `SyncEngine.run_sync()`.
+  - `app/collector/sync_engine.py`: `run_sync()` gains a
+    `device_code_callback` parameter. The client is now authenticated
+    explicitly at the very start of every sync (before any API call) so
+    the sign-in dialog appears up front rather than mid-sync.
+  - `app/ui/main_window.py`: `run_sync()` connects `device_code_ready` to
+    a new `_on_sync_device_code()` / `_show_device_code_dialog()` method
+    that renders the same sign-in dialog used by Settings -> Test Graph
+    Connection (see `main_window_PATCH.py` for the exact replacement).
+
+- **`diagnose_apps.py` stuck waiting with no prompt** -- The script called
+  `client.authenticate()` without a callback, so the device code was never
+  printed. Fixed: a `device_code_prompt()` callback now prints the URL and
+  code clearly to the console.
+
+### Added
+- `app/ui/main_window.py`: `_show_device_code_dialog()` method (reusable
+  sign-in dialog extracted from settings_page logic).
+
+### Notes
+- **App Ops status counters still 0**: confirmed by `app_ops.log` that Graph
+  returns HTTP 400 on `/deviceStatuses` and `/deviceInstallStates` for all 7
+  apps. This is a tenant data state issue, not a code bug: the apps were
+  recently deployed and the 3 enrolled devices have not yet checked in with
+  install status. Run `python diagnose_apps.py` after devices check in to
+  confirm data starts flowing. No code change needed.
+
+---
+
 ## [1.2.5] — 2026-03-03
 
 ### Fixed

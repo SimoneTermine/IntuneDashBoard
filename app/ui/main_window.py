@@ -8,7 +8,7 @@ app/ui/main_window.py  —  v1.2.1 (Remediations removed)
 import logging
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QDialog, QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFrame, QPushButton, QLabel, QStackedWidget,
     QLineEdit, QStatusBar, QSizePolicy, QMessageBox,
 )

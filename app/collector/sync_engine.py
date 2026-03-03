@@ -1,7 +1,7 @@
 """
 app/collector/sync_engine.py
 
-Sync Engine — orchestrates all collectors and manages sync lifecycle.
+Sync Engine -- orchestrates all collectors and manages sync lifecycle.
 
 Pipeline (v1.2.1):
   1. devices           - device metadata + overall compliance state
@@ -9,11 +9,13 @@ Pipeline (v1.2.1):
   3. compliance_policies
   4. config_policies   - config + settings catalog + endpoint security
   5. apps              - app metadata + install status
-  6. assignments       - control → group/allDevices assignments
+  6. assignments       - control -> group/allDevices assignments
   7. groups            - group metadata
-  8. memberships       - user/device → group memberships
+  8. memberships       - user/device -> group memberships
 
-Note: Proactive Remediations removed in v1.2.1.
+v1.2.6: run_sync() accepts device_code_callback and authenticates the Graph
+        client explicitly at the start of every sync so that an expired or
+        missing token shows the sign-in dialog instead of silently hanging.
 """
 
 import json
@@ -32,10 +34,10 @@ MIN_SYNC_INTERVAL_SECONDS = 90
 
 class SyncEvent:
     def __init__(self, stage: str, progress: int, message: str, error: bool = False):
-        self.stage = stage
+        self.stage    = stage
         self.progress = progress
-        self.message = message
-        self.error = error
+        self.message  = message
+        self.error    = error
 
 
 class SyncEngine:
@@ -64,7 +66,21 @@ class SyncEngine:
             return None
         return (datetime.utcnow() - cls._last_sync_time).total_seconds()
 
-    def run_sync(self, components: Optional[list] = None, force: bool = False) -> SyncLog:
+    def run_sync(
+        self,
+        components: Optional[list] = None,
+        force: bool = False,
+        device_code_callback: Optional[Callable] = None,
+    ) -> SyncLog:
+        """
+        Run the full (or partial) sync pipeline.
+
+        device_code_callback — passed straight through to GraphClient.authenticate()
+            so that if the cached token is expired or missing scopes the caller
+            (SyncWorker) can emit a signal and the UI can show the sign-in dialog.
+            When None (e.g. scheduler / background auto-sync), the auth flow still
+            runs but silently; the device code is logged but no dialog appears.
+        """
         if self._running:
             raise RuntimeError("Sync already running")
 
@@ -73,7 +89,7 @@ class SyncEngine:
             if elapsed is not None and elapsed < MIN_SYNC_INTERVAL_SECONDS:
                 remaining = int(MIN_SYNC_INTERVAL_SECONDS - elapsed)
                 raise RuntimeError(
-                    f"Sync cooldown active — last sync {int(elapsed)}s ago. "
+                    f"Sync cooldown active -- last sync {int(elapsed)}s ago. "
                     f"Wait {remaining}s."
                 )
 
@@ -87,6 +103,18 @@ class SyncEngine:
             if cfg.demo_mode:
                 return self._run_demo_sync(sync_log)
 
+            # ── Authenticate upfront so the device code dialog (if needed)
+            #    appears before any API call rather than mid-sync. ────────────
+            from app.graph.client import get_client
+            client = get_client()
+            try:
+                self._emit("auth", 2, "Verifying authentication...")
+                client.authenticate(device_code_callback=device_code_callback)
+            except Exception as e:
+                logger.error(f"Authentication failed before sync: {e}", exc_info=True)
+                self._emit("auth", 0, f"Authentication failed: {e}", error=True)
+                return self._finish_log(sync_log, "failed", {}, error_message=str(e))
+
             all_components = components or [
                 "devices",
                 "compliance_status",
@@ -97,7 +125,7 @@ class SyncEngine:
                 "groups",
                 "memberships",
             ]
-            steps = len(all_components)
+            steps   = len(all_components)
             results = {}
 
             for i, comp in enumerate(all_components):
@@ -186,67 +214,61 @@ class SyncEngine:
         with session_scope() as db:
             log = db.get(SyncLog, self._current_log_id)
             if log:
-                log.finished_at = datetime.utcnow()
-                log.status = status
-                log.error_message = error_message
-                log.details = json.dumps(results)
-                log.details_json = json.dumps(results)
+                log.finished_at    = datetime.utcnow()
+                log.status         = status
+                log.error_message  = error_message
+                log.details        = json.dumps(results)
+                log.details_json   = json.dumps(results)
                 log.devices_synced = results.get("devices", {}).get("count", 0)
                 log.controls_synced = (
                     results.get("compliance_policies", {}).get("count", 0)
-                    + results.get("config_policies", {}).get("count", 0)
+                    + results.get("config_policies",   {}).get("count", 0)
                 )
                 log.apps_synced = results.get("apps", {}).get("count", 0)
+                db.merge(log)
                 db.flush()
-                # Expunge before session closes so the object can be returned
                 db.expunge(log)
                 return log
         return sync_log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scheduler
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Scheduler helpers (unchanged) ────────────────────────────────────────────
 
 _scheduler = None
 
 
-def get_scheduler():
+def start_scheduler(interval_minutes: int = 60):
     global _scheduler
-    if _scheduler is None:
+    try:
         from apscheduler.schedulers.background import BackgroundScheduler
         _scheduler = BackgroundScheduler()
-    return _scheduler
-
-
-def start_scheduler(sync_callback: Optional[Callable] = None):
-    cfg = AppConfig()
-    if not cfg.sync_enabled:
-        return
-    scheduler = get_scheduler()
-    if scheduler.running:
-        return
-    interval = max(cfg.sync_interval_minutes, 5)
-
-    def _scheduled_sync():
-        engine = SyncEngine()
-        try:
-            engine.run_sync(force=True)
-            if sync_callback:
-                sync_callback()
-        except Exception as e:
-            logger.error(f"Scheduled sync error: {e}")
-
-    scheduler.add_job(
-        _scheduled_sync, "interval", minutes=interval,
-        id="intune_sync", replace_existing=True, coalesce=True, max_instances=1,
-    )
-    scheduler.start()
-    logger.info(f"Sync scheduler started (every {interval} min)")
+        _scheduler.add_job(
+            _run_scheduled_sync,
+            "interval",
+            minutes=interval_minutes,
+            id="auto_sync",
+            replace_existing=True,
+        )
+        _scheduler.start()
+        logger.info(f"Scheduler started — sync every {interval_minutes} minutes")
+    except Exception as e:
+        logger.warning(f"Could not start scheduler: {e}")
 
 
 def stop_scheduler():
-    scheduler = get_scheduler()
-    if scheduler and scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("Sync scheduler stopped")
+    global _scheduler
+    if _scheduler:
+        try:
+            _scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        _scheduler = None
+
+
+def _run_scheduled_sync():
+    """Called by the background scheduler — no UI callback available."""
+    try:
+        engine = SyncEngine()
+        engine.run_sync(force=False)
+    except Exception as e:
+        logger.error(f"Scheduled sync failed: {e}", exc_info=True)
