@@ -4,7 +4,7 @@ A local desktop application for Microsoft Intune administrators.
 Connects to Microsoft Graph API, caches data in a local SQLite database,
 and provides a rich UI for device management, policy exploration, and governance.
 
-**Current version: 1.2.4**
+**Current version: 1.2.9**
 
 ---
 
