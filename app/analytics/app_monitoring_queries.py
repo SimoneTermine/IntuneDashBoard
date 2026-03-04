@@ -12,6 +12,13 @@ Queries:
   get_app_error_analysis()         — error code clustering with descriptions
   get_install_state_distribution() — state distribution across all apps
 
+v1.3.0:
+  get_all_install_records() and get_device_installs_for_app() now fall back
+  to synthetic rows derived from App.raw_json["_install_overview"] when
+  DeviceAppStatus is empty (i.e. getDeviceInstallStatusReport is unavailable
+  for this tenant). Synthetic rows carry "_source": "overview" to let the UI
+  show an appropriate banner.
+
 v1.2.9:
   get_app_install_summary() and get_app_monitoring_kpis() now use
   App.raw_json["_install_overview"] (saved by AppCollector.sync_apps via
@@ -145,72 +152,53 @@ def get_app_monitoring_kpis() -> dict[str, Any]:
 
     Primary source: App.raw_json["_install_overview"] (from Reports API).
     This is always populated after sync, even if DeviceAppStatus is empty.
-
-    Secondary source: DeviceAppStatus table (for total_records, error analysis).
     """
     with session_scope() as db:
-        total_apps = db.query(func.count(App.id)).scalar() or 0
-        apps = db.query(App.raw_json).all()
+        apps = db.query(App).all()
+        total_apps = len(apps)
 
-        # Sum KPIs from overview (primary — guaranteed after Reports API sync)
-        installed     = 0
-        failed        = 0
-        pending       = 0
-        not_installed = 0
-        not_applicable = 0
-        apps_with_data = 0
+        installed = failed = pending = not_installed = 0
+        devices_with_failures: set[str] = set()
 
-        for (raw_json,) in apps:
-            ov = _read_overview(raw_json)
+        for app in apps:
+            ov = _read_overview(app.raw_json)
             if ov:
-                apps_with_data += 1
-                installed      += int(ov.get("InstalledDeviceCount",    0) or 0)
-                failed         += int(ov.get("FailedDeviceCount",       0) or 0)
-                pending        += int(ov.get("PendingInstallDeviceCount", 0) or 0)
-                not_installed  += int(ov.get("NotInstalledDeviceCount", 0) or 0)
-                not_applicable += int(ov.get("NotApplicableDeviceCount", 0) or 0)
+                installed     += ov.get("InstalledDeviceCount", 0) or 0
+                f              = ov.get("FailedDeviceCount", 0) or 0
+                failed        += f
+                pending       += ov.get("PendingInstallDeviceCount", 0) or 0
+                not_installed += ov.get("NotInstalledDeviceCount", 0) or 0
+                if f > 0:
+                    devices_with_failures.add(app.id)
 
-        total_records = installed + failed + pending + not_installed + not_applicable
-
-        # These still come from DeviceAppStatus (for per-device analytics)
-        apps_with_failures = (
-            db.query(func.count(DeviceAppStatus.app_id.distinct()))
-            .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
-            .scalar() or 0
-        )
-        devices_with_failures = (
-            db.query(func.count(DeviceAppStatus.device_id.distinct()))
-            .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
-            .scalar() or 0
+        total_tracked = installed + failed + pending + not_installed
+        install_rate = (
+            round(100 * installed / total_tracked)
+            if total_tracked > 0
+            else 0
         )
 
-        install_rate = round((installed / total_records * 100), 1) if total_records else 0
-
-    return {
-        "total_apps":            total_apps,
-        "apps_with_data":        apps_with_data,
-        "total_records":         total_records,
-        "installed":             installed,
-        "failed":                failed,
-        "pending":               pending,
-        "not_installed":         not_installed,
-        "apps_with_failures":    apps_with_failures,
-        "devices_with_failures": devices_with_failures,
-        "install_rate":          install_rate,
-    }
+        return {
+            "total_apps":           total_apps,
+            "installed":            installed,
+            "failed":               failed,
+            "pending":              pending,
+            "not_installed":        not_installed,
+            "install_rate":         install_rate,
+            "devices_with_failures": len(devices_with_failures),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-app aggregated summary
+# App Catalog: per-app aggregated counts
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_app_install_summary() -> list[dict]:
     """
-    One row per app: installed / failed / pending / not_installed counts
-    and a success rate percentage.
+    One row per app with aggregated install state counts.
 
-    Primary source: App.raw_json["_install_overview"] (Reports API overview).
-    Fallback: DeviceAppStatus rows (for backwards compatibility / demo mode).
+    Primary source: App.raw_json["_install_overview"].
+    Falls back to DeviceAppStatus aggregation for backwards compat / demo mode.
     """
     with session_scope() as db:
         apps = db.query(App).order_by(App.display_name).all()
@@ -220,54 +208,64 @@ def get_app_install_summary() -> list[dict]:
             ov = _read_overview(app.raw_json)
 
             if ov:
-                # Use pre-computed overview counts from Reports API
-                installed    = int(ov.get("InstalledDeviceCount",     0) or 0)
-                failed       = int(ov.get("FailedDeviceCount",        0) or 0)
-                pending      = int(ov.get("PendingInstallDeviceCount", 0) or 0)
-                not_inst     = int(ov.get("NotInstalledDeviceCount",  0) or 0)
-                not_appl     = int(ov.get("NotApplicableDeviceCount", 0) or 0)
-                total        = installed + failed + pending + not_inst + not_appl
+                installed     = ov.get("InstalledDeviceCount",     0) or 0
+                failed        = ov.get("FailedDeviceCount",         0) or 0
+                pending       = ov.get("PendingInstallDeviceCount", 0) or 0
+                not_installed = ov.get("NotInstalledDeviceCount",   0) or 0
+                not_applicable = ov.get("NotApplicableDeviceCount", 0) or 0
+                total = installed + failed + pending + not_installed + not_applicable
             else:
-                # Fallback: aggregate from DeviceAppStatus (demo mode / legacy)
-                statuses = (
-                    db.query(DeviceAppStatus.install_state, func.count(DeviceAppStatus.id))
+                # Fallback: aggregate DeviceAppStatus
+                rows = (
+                    db.query(
+                        func.lower(DeviceAppStatus.install_state).label("state"),
+                        func.count(DeviceAppStatus.id).label("cnt"),
+                    )
                     .filter(DeviceAppStatus.app_id == app.id)
-                    .group_by(DeviceAppStatus.install_state)
+                    .group_by(func.lower(DeviceAppStatus.install_state))
                     .all()
                 )
                 counts: dict[str, int] = {}
-                for state, cnt in statuses:
-                    counts[str(state or "unknown").lower()] = cnt
+                for state, cnt in rows:
+                    counts[state or "unknown"] = cnt
+                installed     = sum(counts.get(s, 0) for s in _INSTALLED_STATES)
+                failed        = sum(counts.get(s, 0) for s in _FAILED_STATES)
+                pending       = sum(counts.get(s, 0) for s in _PENDING_STATES)
+                not_installed = sum(counts.get(s, 0) for s in _NOT_INSTALLED_STATES)
+                total = sum(counts.values())
 
-                installed = sum(counts.get(s, 0) for s in _INSTALLED_STATES)
-                failed    = sum(counts.get(s, 0) for s in _FAILED_STATES)
-                pending   = sum(counts.get(s, 0) for s in _PENDING_STATES)
-                not_inst  = sum(counts.get(s, 0) for s in _NOT_INSTALLED_STATES)
-                not_appl  = 0
-                total     = sum(counts.values())
+            total_devices = installed + failed + pending + not_installed
+            success_rate  = (
+                f"{round(100 * installed / total_devices)}%"
+                if total_devices > 0
+                else "—"
+            )
 
-            success_rate = round(installed / total * 100, 1) if total else None
+            try:
+                rj = json.loads(app.raw_json) if app.raw_json else {}
+            except Exception:
+                rj = {}
 
             result.append({
-                "id":            app.id,
-                "display_name":  app.display_name or "—",
-                "app_type":      app.app_type or "—",
-                "publisher":     app.publisher or "—",
-                "installed":     installed,
-                "failed":        failed,
-                "pending":       pending,
-                "not_installed": not_inst,
-                "total_devices": total,
-                "success_rate":  f"{success_rate}%" if success_rate is not None else "—",
+                "id":           app.id,
+                "display_name": app.display_name or "—",
+                "app_type":     app.app_type     or "—",
+                "publisher":    rj.get("publisher") or "—",
+                "installed":    installed,
+                "failed":       failed,
+                "pending":      pending,
+                "not_installed": not_installed,
+                "success_rate": success_rate,
+                "total_devices": total_devices,
+                "is_assigned":  "Yes" if rj.get("isAssigned") else "No",
                 "last_modified": _fmt_dt(app.last_modified_datetime),
-                "is_assigned":   "Yes" if app.is_assigned else "No",
             })
 
         return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flat install records table
+# Install Log: flat device × app × state table
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_all_install_records(
@@ -276,8 +274,14 @@ def get_all_install_records(
     limit: int = 2000,
 ) -> list[dict]:
     """
-    Flat device x app x state table (Install Log tab).
-    Reads from DeviceAppStatus — populated by getDeviceInstallStatusReport.
+    Flat install log.
+
+    Primary source: DeviceAppStatus (populated by getDeviceInstallStatusReport).
+    Fallback: synthesize rows from App.raw_json["_install_overview"] when
+    DeviceAppStatus is empty (Reports API beta endpoint unavailable for tenant).
+
+    Synthetic rows carry "_source": "overview" and "_synthetic": True so the
+    UI can display an appropriate banner.
     """
     logger.info(
         f"Install log query: state_filter={state_filter!r} "
@@ -312,9 +316,72 @@ def get_all_install_records(
                 "_app_id":         das.app_id,
                 "_device_id":      das.device_id,
                 "_error_code_raw": das.error_code,
+                "_source":         "per-device",
+                "_synthetic":      False,
             })
         logger.info(f"Install log query: {len(result)} records returned")
-        return result
+
+    # ── Fallback to overview when DeviceAppStatus is empty ────────────────────
+    if not result:
+        logger.info("Install log: DeviceAppStatus empty — falling back to overview data")
+        result = _get_install_records_from_overview(state_filter, app_id_filter)
+
+    return result
+
+
+def _get_install_records_from_overview(
+    state_filter: str = "",
+    app_id_filter: str = "",
+) -> list[dict]:
+    """
+    Synthesize install-log rows from App.raw_json["_install_overview"].
+
+    Each (app, state bucket) with count > 0 produces one row.
+    The "device_name" column shows the bucket count (e.g. "3 devices").
+    All rows carry _synthetic=True so the UI can show a data-source banner.
+    """
+    _BUCKET_MAP = [
+        ("InstalledDeviceCount",        "installed"),
+        ("FailedDeviceCount",           "failed"),
+        ("PendingInstallDeviceCount",   "pendingInstall"),
+        ("NotInstalledDeviceCount",     "notInstalled"),
+        ("NotApplicableDeviceCount",    "notApplicable"),
+    ]
+
+    result = []
+    with session_scope() as db:
+        apps = db.query(App).order_by(App.display_name).all()
+        for app in apps:
+            if app_id_filter and app.id != app_id_filter:
+                continue
+            ov = _read_overview(app.raw_json)
+            if not ov:
+                continue
+            for graph_key, state_label in _BUCKET_MAP:
+                count = ov.get(graph_key, 0) or 0
+                if count == 0:
+                    continue
+                if state_filter and state_filter.lower() not in state_label.lower():
+                    continue
+                result.append({
+                    "app_name":    app.display_name or "—",
+                    "app_type":    app.app_type     or "—",
+                    "device_name": f"{count} device{'s' if count != 1 else ''}",
+                    "user":        "—",
+                    "os":          "—",
+                    "install_state": state_label,
+                    "error_code":  "—",
+                    "error_desc":  "Per-device data unavailable (Reports API beta endpoint not supported by tenant)",
+                    "last_sync":   "—",
+                    "_app_id":     app.id,
+                    "_device_id":  None,
+                    "_error_code_raw": None,
+                    "_source":     "overview",
+                    "_synthetic":  True,
+                })
+
+    logger.info(f"Install log fallback: {len(result)} synthetic rows from overview")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +389,13 @@ def get_all_install_records(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_device_installs_for_app(app_id: str) -> list[dict]:
-    """All device install records for a specific app, with device metadata."""
+    """
+    All device install records for a specific app, with device metadata.
+
+    Primary source: DeviceAppStatus.
+    Fallback: synthesize from _install_overview when DeviceAppStatus is empty.
+    Synthetic rows carry "_synthetic": True.
+    """
     logger.info(f"Drill-down: loading device installs for app_id={app_id}")
     with session_scope() as db:
         rows = (
@@ -347,9 +420,60 @@ def get_device_installs_for_app(app_id: str) -> list[dict]:
                 "last_sync":       _fmt_dt(das.last_sync_date_time),
                 "_device_id":      das.device_id,
                 "_error_code_raw": das.error_code,
+                "_synthetic":      False,
             })
     logger.info(f"Drill-down: {len(result)} records returned for app_id={app_id}")
+
+    # ── Fallback ──────────────────────────────────────────────────────────────
+    if not result:
+        logger.info(f"Drill-down: no DeviceAppStatus rows — falling back to overview for {app_id}")
+        result = _get_device_overview_for_app(app_id)
+
     return result
+
+
+def _get_device_overview_for_app(app_id: str) -> list[dict]:
+    """
+    Synthesize drill-down rows from _install_overview for one app.
+    One row per non-zero state bucket.
+    """
+    _BUCKET_MAP = [
+        ("InstalledDeviceCount",        "installed"),
+        ("FailedDeviceCount",           "failed"),
+        ("PendingInstallDeviceCount",   "pendingInstall"),
+        ("NotInstalledDeviceCount",     "notInstalled"),
+        ("NotApplicableDeviceCount",    "notApplicable"),
+    ]
+
+    with session_scope() as db:
+        app = db.query(App).filter(App.id == app_id).first()
+        if not app:
+            return []
+        ov = _read_overview(app.raw_json)
+        if not ov:
+            return []
+
+        result = []
+        for graph_key, state_label in _BUCKET_MAP:
+            count = ov.get(graph_key, 0) or 0
+            if count == 0:
+                continue
+            result.append({
+                "device_name":   f"{count} device{'s' if count != 1 else ''}",
+                "user":          "—",
+                "os":            "—",
+                "os_version":    "—",
+                "ownership":     "—",
+                "compliance":    "—",
+                "install_state": state_label,
+                "error_code":    "—",
+                "error_desc":    "Aggregated overview only — per-device data unavailable",
+                "last_sync":     "—",
+                "_device_id":    None,
+                "_error_code_raw": None,
+                "_synthetic":    True,
+            })
+        return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,113 +484,117 @@ def get_app_error_analysis() -> list[dict]:
     """
     Error codes ranked by frequency, with human-readable descriptions
     and the list of affected apps and devices.
+
+    Returns empty list when DeviceAppStatus has no failed records (e.g. when
+    getDeviceInstallStatusReport is not available for the tenant).
     """
     with session_scope() as db:
         rows = (
             db.query(
                 DeviceAppStatus.error_code,
                 func.count(DeviceAppStatus.id).label("device_count"),
-                func.count(DeviceAppStatus.app_id.distinct()).label("app_count"),
+                func.count(func.distinct(DeviceAppStatus.app_id)).label("app_count"),
             )
-            .filter(DeviceAppStatus.error_code.isnot(None))
-            .filter(DeviceAppStatus.error_code != 0)
-            .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
+            .filter(
+                DeviceAppStatus.error_code.isnot(None),
+                DeviceAppStatus.error_code != 0,
+            )
             .group_by(DeviceAppStatus.error_code)
-            .order_by(desc(func.count(DeviceAppStatus.id)))
+            .order_by(desc("device_count"))
             .limit(50)
             .all()
         )
 
         result = []
-        for code, device_count, app_count in rows:
-            desc_str = _err_desc(code)
-            severity = (
-                "critical" if device_count >= 10
-                else "high"    if device_count >= 5
-                else "medium"  if device_count >= 2
-                else "low"
-            )
+        for error_code, device_count, app_count in rows:
+            desc_str = _err_desc(error_code)
+            hex_code = _hex(error_code)
 
-            # Top affected apps for this error code
+            # Top affected apps
             affected = (
                 db.query(App.display_name)
                 .join(DeviceAppStatus, DeviceAppStatus.app_id == App.id)
-                .filter(DeviceAppStatus.error_code == code)
-                .filter(func.lower(DeviceAppStatus.install_state).in_(_FAILED_STATES))
-                .distinct()
-                .limit(5)
+                .filter(DeviceAppStatus.error_code == error_code)
+                .group_by(App.id, App.display_name)
+                .order_by(desc(func.count(DeviceAppStatus.id)))
+                .limit(3)
                 .all()
             )
-            affected_names = ", ".join(r[0] or "—" for r in affected)
+            affected_str = ", ".join(a[0] or "—" for a in affected)
+
+            severity = (
+                "high"   if device_count >= 5 else
+                "medium" if device_count >= 2 else
+                "ok"
+            )
 
             result.append({
-                "error_code":    _hex(code),
+                "error_code":    hex_code,
                 "description":   desc_str,
                 "device_count":  device_count,
                 "app_count":     app_count,
                 "severity":      severity,
-                "affected_apps": affected_names,
+                "affected_apps": affected_str,
+                "_error_code_raw": error_code,
             })
+
         return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Install state distribution
+# Install state distribution (for Overview bar)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_install_state_distribution() -> list[dict]:
     """
-    Aggregate install state distribution across all apps.
-    Primary: from _install_overview in App.raw_json (always populated).
-    Fallback: from DeviceAppStatus (demo / legacy).
+    Aggregate install state counts across all apps for the state bar.
+
+    Primary source: App.raw_json["_install_overview"].
     """
+    _BUCKET_MAP = [
+        ("InstalledDeviceCount",        "installed"),
+        ("FailedDeviceCount",           "failed"),
+        ("PendingInstallDeviceCount",   "pendingInstall"),
+        ("NotInstalledDeviceCount",     "notInstalled"),
+        ("NotApplicableDeviceCount",    "notApplicable"),
+    ]
+
+    totals: dict[str, int] = {label: 0 for _, label in _BUCKET_MAP}
+
     with session_scope() as db:
-        apps = db.query(App.raw_json).all()
+        apps = db.query(App).all()
+        has_overview = False
 
-    # Try overview first
-    merged: dict[str, int] = {}
-    has_overview = False
-    for (raw_json,) in apps:
-        ov = _read_overview(raw_json)
-        if ov:
-            has_overview = True
-            merged["installed"]    = merged.get("installed",    0) + int(ov.get("InstalledDeviceCount",     0) or 0)
-            merged["failed"]       = merged.get("failed",       0) + int(ov.get("FailedDeviceCount",        0) or 0)
-            merged["pendingInstall"] = merged.get("pendingInstall", 0) + int(ov.get("PendingInstallDeviceCount", 0) or 0)
-            merged["notInstalled"] = merged.get("notInstalled", 0) + int(ov.get("NotInstalledDeviceCount",  0) or 0)
+        for app in apps:
+            ov = _read_overview(app.raw_json)
+            if ov:
+                has_overview = True
+                for graph_key, label in _BUCKET_MAP:
+                    totals[label] += ov.get(graph_key, 0) or 0
 
-    if has_overview:
-        return [
-            {"state": s, "count": c}
-            for s, c in sorted(merged.items(), key=lambda x: -x[1])
-            if c > 0
-        ]
-
-    # Fallback: DeviceAppStatus
-    _NORM_MAP = {
-        "success":         "installed",
-        "installfailed":   "failed",
-        "uninstallfailed": "failed",
-        "not installed":   "notInstalled",
-        "notapplicable":   "notInstalled",
-        "pending":         "pendingInstall",
-        "downloading":     "pendingInstall",
-        "installing":      "pendingInstall",
-    }
-    with session_scope() as db:
-        rows = (
-            db.query(DeviceAppStatus.install_state, func.count(DeviceAppStatus.id))
-            .group_by(DeviceAppStatus.install_state)
-            .order_by(desc(func.count(DeviceAppStatus.id)))
-            .all()
-        )
-    merged2: dict[str, int] = {}
-    for raw_state, cnt in rows:
-        state      = (raw_state or "unknown").strip()
-        normalised = _NORM_MAP.get(state.lower(), state)
-        merged2[normalised] = merged2.get(normalised, 0) + cnt
+        # Fallback to DeviceAppStatus if no overview data at all
+        if not has_overview:
+            rows = (
+                db.query(
+                    func.lower(DeviceAppStatus.install_state).label("state"),
+                    func.count(DeviceAppStatus.id).label("cnt"),
+                )
+                .group_by(func.lower(DeviceAppStatus.install_state))
+                .all()
+            )
+            for state, cnt in rows:
+                if state in _INSTALLED_STATES:
+                    totals["installed"] += cnt
+                elif state in _FAILED_STATES:
+                    totals["failed"] += cnt
+                elif state in _PENDING_STATES:
+                    totals["pendingInstall"] += cnt
+                else:
+                    totals["notInstalled"] += cnt
 
     return [
-        {"state": s, "count": c}
-        for s, c in sorted(merged2.items(), key=lambda x: -x[1])
+        {"state": label, "count": count}
+        for _, label in _BUCKET_MAP
+        for count in [totals[label]]
+        if count > 0
     ]

@@ -10,6 +10,86 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.3.1] — 2026-03-04
+
+### Fixed
+- **`Catalog refresh failed: datetime.datetime object is not subscriptable`** — `get_app_install_summary()` used `(app.last_modified_datetime or "")[:19]`; when the column is a Python `datetime` object (not a string), slicing raises `TypeError`. Fixed by using the `_fmt_dt()` helper.
+- **"Open in Intune Portal" → 404 `AppOverviewBlade` error** — the blade was removed from the Intune portal. Correct URL: `SettingsMenu/~/0/appId/{id}`. Updated in `_show_ctx_menu()`.
+- **App Ops UI regressed visually** — custom `KpiCard` with `paintEvent` and complex `StateBar` caused rendering issues. Reverted to global `KpiCard` from `app/ui/widgets/kpi_card.py`; simplified `StateBar` to a flat proportional strip; removed `paintEvent` border.
+
+### Changed
+- `app/analytics/app_monitoring_queries.py`: `get_app_install_summary()` uses `_fmt_dt()` for dates.
+- `app/ui/pages/app_ops_page.py`: rewritten — global KpiCard, simplified StateBar, correct portal URL.
+- `app/version.py`: bumped to `1.3.1`.
+
+
+---
+
+## [1.3.0] — 2026-03-04
+
+### Added
+- **App Ops — complete UI redesign**
+  - `KpiCard` redesigned with colored left-accent border, separated from the
+    global widget in `app/ui/widgets/kpi_card.py` to allow per-page customisation.
+  - `StateBar` rewritten: proportional segments with rounded ends, inline state
+    labels, per-state color coding (Catppuccin Mocha palette).
+  - `InfoBanner` helper widget: `info` / `warning` / `error` levels with icon.
+  - **Data-source banner**: when `DeviceAppStatus` is empty (per-device Reports API
+    endpoint unavailable), a yellow `⚠️` banner appears below the state bar
+    explaining the situation and confirming KPIs are still accurate.
+  - **Install Log synthetic banner**: shown inside the Install Log tab when rows
+    are synthesised from `_install_overview` rather than per-device records.
+  - **Error Analysis empty state**: replaces empty table with a friendly icon +
+    explanation when no error-code data is available.
+  - **Device Drill-down empty state**: placeholder shown before an app is selected;
+    replaced by drill-down data (or aggregated overview) once an app is chosen.
+  - Right-click context menu fully rewritten: consistent styling, correct portal
+    URL, "Show in Install Log" cross-tab action.
+  - Header now shows last-refresh timestamp.
+
+- **App Ops — Install Log and Device Drill-down fallback**
+  - `get_all_install_records()`: when `DeviceAppStatus` is empty, calls new
+    `_get_install_records_from_overview()` helper that synthesises one row per
+    non-zero state bucket from `App.raw_json["_install_overview"]`.
+    Synthetic rows carry `"_synthetic": True` so the UI renders the banner.
+  - `get_device_installs_for_app()`: same fallback via
+    `_get_device_overview_for_app()`. The drill-down tab shows aggregated counts
+    (e.g. "3 devices — installed") rather than an empty table.
+  - State filter in Install Log now correctly filters synthetic rows too.
+
+- **Graph Query Lab — POST / PATCH / DELETE support**
+  - Method selector: `GET`, `POST`, `PATCH`, `DELETE`.
+  - **Request Body editor** (JSON): appears automatically for `POST` / `PATCH`.
+    Monospaced font, full height, placeholder with example body.
+  - **Live JSON validation**: status indicator updates on every keystroke —
+    `✓ valid JSON` (green) or `✗ <error> (line N)` (red).
+  - **Format JSON** button: pretty-prints and validates the body in place.
+  - **Copy Result** button: copies the full JSON output to clipboard.
+  - **Preset library**: 7 built-in presets covering the most common endpoints,
+    including `getAppStatusOverviewReport` and `getDeviceInstallStatusReport`
+    with pre-filled example bodies.
+  - Paged-collection mode automatically disabled for non-GET methods.
+  - Run button accent color changes per method (green=GET, blue=POST,
+    yellow=PATCH, red=DELETE).
+
+### Changed
+- `app/analytics/app_monitoring_queries.py`: `get_all_install_records()` and
+  `get_device_installs_for_app()` now return `_synthetic` and `_source` metadata
+  fields; both functions fall back to overview-derived rows when `DeviceAppStatus`
+  is empty. `get_install_state_distribution()` returns a list of
+  `{"state", "count"}` dicts (consistent with StateBar input format).
+- `app/ui/pages/app_ops_page.py`: full rewrite — new KpiCard, StateBar,
+  InfoBanner, empty states; context menus via unified `_build_context_menu_actions`
+  helper; cross-tab "Show in Install Log" action wired from App Catalog.
+- `app/ui/pages/graph_query_page.py`: full rewrite — method selector, body
+  editor, preset library, Copy Result, per-method run-button styling.
+- `app/version.py`: bumped to `1.3.0`.
+- `README.md`: updated version badge, feature table (App Ops and Graph Query Lab
+  descriptions), added "App Ops — Data Sources" and "Graph Query Lab" sections,
+  corrected repo URL.
+
+---
+
 ## [1.2.9] — 2026-03-03
 
 ### Fixed

@@ -14,7 +14,12 @@ app/version.py -- Single source of truth for the application version.
   1.2.8 -- App Ops: replaced /deviceStatuses with Reports API (getAppStatusOverviewReport)
   1.2.9 -- App Ops: getDeviceInstallStatusReport uses beta (not v1.0); UI reads
            install counts from App.raw_json[_install_overview] instead of DeviceAppStatus
+  1.3.0 -- App Ops: full UI redesign (accent KPI cards, segmented state bar, empty states,
+           data-source banner when Reports API beta unavailable); Install Log and Device
+           Drill-down fall back to _install_overview synthetic rows when DeviceAppStatus
+           is empty; Graph Query Lab: GET/POST/PATCH/DELETE selector, JSON body editor
+           with live validation and Format button, Copy Result, preset library
 """
 
-__version__ = "1.2.9"
+__version__ = "1.3.1"
 APP_NAME = "Intune Dashboard"

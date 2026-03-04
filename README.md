@@ -4,7 +4,7 @@ A local desktop application for Microsoft Intune administrators.
 Connects to Microsoft Graph API, caches data in a local SQLite database,
 and provides a rich UI for device management, policy exploration, and governance.
 
-**Current version: 1.2.9**
+**Current version: 1.3.1**
 
 ---
 
@@ -15,11 +15,11 @@ and provides a rich UI for device management, policy exploration, and governance
 | **Overview** | KPI cards, compliance charts, recent sync log |
 | **Device Explorer** | Search, filter, sort devices; right-click context menu |
 | **Policy Explorer** | Compliance, config, Settings Catalog, Endpoint Security, apps |
-| **App Ops** | Deployment state, top failures, install error clustering |
+| **App Ops** | KPI strip, segmented state bar, App Catalog (overview counts), Install Log, Error Analysis, Device Drill-down. Falls back to aggregated data when the Reports API beta endpoint is not available for the tenant |
 | **Governance** | Point-in-time snapshots, drift detection between snapshots |
 | **Explainability** | Full reasoning chain: why a policy applies to a device |
 | **Group Usage** | Objects assigned to a group, dead-assignment detection |
-| **Graph Query Lab** | Ad-hoc Graph API tool with paged collection support |
+| **Graph Query Lab** | Ad-hoc Graph API tool: GET with paged collection, POST/PATCH/DELETE with JSON body editor, live JSON validation, preset library |
 | **Settings** | Tenant / auth config, scheduler, storage paths |
 
 ---
@@ -59,8 +59,8 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```bash
-git clone https://github.com/yourorg/intune-dashboard.git
-cd intune-dashboard
+git clone https://github.com/SimoneTermine/IntuneDashBoard.git
+cd IntuneDashBoard
 
 python -m venv .venv
 .venv\Scripts\activate        # Windows
@@ -87,64 +87,46 @@ python main.py
 - **Cache location**: `%APPDATA%\IntuneDashboard\msal_cache.bin`
 - **Encryption**: DPAPI via msal-extensions (Windows, bound to your user account).
   Falls back to plain JSON if msal-extensions is not installed.
-- **Sign out**: Settings → *Sign out / Clear Token Cache* removes the cache and
-  forces a fresh device code sign-in on next sync.
-- **Admin consent**: if you see `403 / AADSTS65001`, use
-  Settings → *Open Admin Consent Page* — a Global Administrator must grant consent.
 
 ---
 
-## Log Files
+## App Ops — Data Sources
 
-Logs are written to `%APPDATA%\IntuneDashboard\logs\`.
+App Ops uses two Graph API endpoints for install status data:
 
-| File | Content |
+| Endpoint | API | What it provides |
+|---|---|---|
+| `getAppStatusOverviewReport` | beta | Aggregated counts per app (always works) |
+| `getDeviceInstallStatusReport` | beta | Per-device rows for Install Log and Drill-down |
+
+If your tenant does not support `getDeviceInstallStatusReport` (HTTP 400 returned),
+the **App Catalog** and **KPI cards** remain fully accurate using the overview data.
+**Install Log** and **Device Drill-down** will show aggregated overview rows with a
+yellow banner explaining the limitation.
+
+---
+
+## Graph Query Lab
+
+The Graph Query Lab supports all four HTTP methods:
+
+| Method | Use case |
 |---|---|
-| `intune_dashboard.log` | Everything (root logger) |
-| `graph.log` | Graph API calls and auth events |
-| `collector.log` | Sync engine and data collectors |
-| `db.log` | Database operations |
-| `ui.log` | UI events |
-| `app_ops.log` | App Ops page: KPI/drill-down/filter queries, per-app sync stats, DB write errors |
+| **GET** | Retrieve resources; optionally collect all pages automatically |
+| **POST** | Reports API (e.g. `getAppStatusOverviewReport`), create resources |
+| **PATCH** | Update resource properties |
+| **DELETE** | Remove resources |
 
-**Rotation** (SCCM-style): when a log file reaches **2 MB** it is automatically
-renamed to `<name>_<YYYY-MM-DD>.log` (e.g. `intune_dashboard_2026-03-03.log`) and
-a fresh `<name>.log` is started. If that dated archive already exists, a counter
-is appended: `_1`, `_2`, etc.
+The JSON body editor includes live syntax validation and a Format button.
+A preset library provides one-click access to the most common endpoints.
 
 ---
 
-## Data Storage
+## Logs
 
-| Path | Content |
+| File | Contents |
 |---|---|
-| `%APPDATA%\IntuneDashboard\intune_dashboard.db` | Local SQLite cache |
-| `%APPDATA%\IntuneDashboard\msal_cache.bin` | Encrypted MSAL token cache |
-| `%APPDATA%\IntuneDashboard\config.json` | Application settings |
-| `%APPDATA%\IntuneDashboard\exports\` | CSV / JSON / PDF exports |
+| `collector.log` | Full sync engine trace (devices, policies, apps, groups) |
+| `app_ops.log` | App install status subsystem (Reports API calls, per-app detail) |
 
----
-
-## Demo Mode
-
-Enable **Demo Mode** in Settings to explore the UI without real credentials.
-A synthetic dataset of devices, policies, and apps is loaded from
-`app/demo/demo_data.py`. Disable before connecting to a real tenant.
-
----
-
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
----
-
-## Building a Standalone Executable
-
-```bash
-pyinstaller intune_dashboard.spec
-```
-
-Output in `dist/IntuneDashboard/`.
+Both rotate at 2 MB with date-stamped archives (SCCM-style handler).
