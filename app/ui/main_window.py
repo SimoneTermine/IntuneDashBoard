@@ -2,7 +2,7 @@
 Main application window.
 Sidebar navigation → StackedWidget pages.
 Global search bar, sync status, status bar.
-app/ui/main_window.py  —  v1.2.1 (Remediations removed)
+app/ui/main_window.py  —  v1.4.0
 """
 
 import logging
@@ -20,6 +20,7 @@ from app.ui.pages import (
     PolicyExplorerPage, ExplainabilityPage, AppOpsPage,
     GovernancePage, GroupUsagePage,
     SettingsPage, GraphQueryPage,
+    SecurityPage,
 )
 from app.ui.widgets.sync_status_widget import SyncStatusWidget
 from app.version import APP_NAME, __version__
@@ -95,6 +96,8 @@ class MainWindow(QMainWindow):
             ("🧪", "Graph Query Lab",  "graph_query",   False),
             (None, "GOVERNANCE", None,             True),
             ("📈", "Drift & Snapshots", "governance",   False),
+            (None, "SECURITY",   None,             True),
+            ("🛡️", "Security Audit",   "security",      False),
             (None, "SETTINGS",   None,             True),
             ("⚙️", "Settings",   "settings",       False),
         ]
@@ -182,6 +185,7 @@ class MainWindow(QMainWindow):
             "app_ops":       AppOpsPage(),
             "graph_query":   GraphQueryPage(),
             "governance":    GovernancePage(),
+            "security":      SecurityPage(),
             "settings":      SettingsPage(),
         }
 
@@ -196,6 +200,8 @@ class MainWindow(QMainWindow):
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._focus_search)
         QShortcut(QKeySequence("F5"), self).activated.connect(self._refresh_current)
+
+    # ── Navigation ────────────────────────────────────────────────────────
 
     def _navigate(self, page_key: str):
         if page_key not in self._pages:
@@ -220,9 +226,7 @@ class MainWindow(QMainWindow):
         self._navigate("device_detail")
         self._pages["device_detail"].load_device(device_id)
 
-    def _focus_search(self):
-        self._global_search.setFocus()
-        self._global_search.selectAll()
+    # ── Global search ─────────────────────────────────────────────────────
 
     def _global_search_action(self):
         query = self._global_search.text().strip()
@@ -232,6 +236,10 @@ class MainWindow(QMainWindow):
         if hasattr(self._pages["devices"], "set_search"):
             self._pages["devices"].set_search(query)
 
+    def _focus_search(self):
+        self._global_search.setFocus()
+        self._global_search.selectAll()
+
     def _refresh_current(self):
         current = self._stack.currentWidget()
         if current and hasattr(current, "refresh"):
@@ -239,6 +247,8 @@ class MainWindow(QMainWindow):
                 current.refresh()
             except Exception as e:
                 logger.warning(f"Manual refresh failed: {e}")
+
+    # ── Sync ─────────────────────────────────────────────────────────────
 
     def run_sync(self):
         from app.ui.workers.sync_worker import SyncWorker
@@ -250,32 +260,14 @@ class MainWindow(QMainWindow):
         self._sync_worker = SyncWorker()
         self._sync_worker.finished.connect(self._on_sync_finished)
         self._sync_worker.progress.connect(self._on_sync_progress)
-        # ── NEW: show device-code dialog if auth is needed during sync ──────
         self._sync_worker.device_code_ready.connect(self._on_device_code_needed)
         self._sync_worker.start()
-        
-        # ── NEW METHOD — add after run_sync ──────────────────────────────────────
 
     def _on_device_code_needed(self, user_code: str, uri: str):
-        """
-        Called (via Qt signal, always in main thread) when a sync requires
-        interactive authentication.  Shows the device-code dialog so the user
-        can sign in without leaving the app.
-        """
         self._show_device_code_dialog(user_code, uri)
 
     def _show_device_code_dialog(self, user_code: str, uri: str):
-        """
-        Non-blocking device-code dialog.  The sync continues waiting in the
-        background thread; this dialog just gives the user the code + URL.
-        It closes automatically when the sync worker emits finished().
-        """
-        from PySide6.QtWidgets import (
-            QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-            QPushButton, QFrame, QApplication,
-        )
-        from PySide6.QtCore import Qt
-
+        """Non-blocking device-code dialog. Closes automatically when sync finishes."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Sign in to Microsoft")
         dlg.setMinimumWidth(480)
@@ -302,7 +294,6 @@ class MainWindow(QMainWindow):
         lay.addWidget(sep)
 
         lay.addWidget(QLabel("Your sign-in code:"))
-
         code_lbl = QLabel(
             f'<span style="font-size:32px;font-weight:bold;'
             f'letter-spacing:6px;color:#cba6f7">{user_code}</span>'
@@ -337,16 +328,14 @@ class MainWindow(QMainWindow):
         note.setStyleSheet("color: #6c7086; font-size: 10px;")
         lay.addWidget(note)
 
-        # Auto-close when sync finishes
         if self._sync_worker:
             self._sync_worker.finished.connect(dlg.accept)
 
-        dlg.show()   # non-blocking (show, not exec)
-        
-        # ──────────────────────────────────────
+        dlg.show()
 
-    def _on_sync_progress(self, msg: str):
-        self._status_bar.showMessage(f"Sync: {msg}")
+    def _on_sync_progress(self, stage: str, percent: int, message: str, is_error: bool):
+        self._status_bar.showMessage(f"Sync: {message}")
+        self._sync_widget.update_progress(stage, percent, message, is_error)
 
     def _on_sync_finished(self, success: bool, message: str):
         self._sync_widget.set_syncing(False)

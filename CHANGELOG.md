@@ -10,6 +10,62 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.4.1] — 2026-03-05
+
+### Changed
+- `app/ui/pages/security_page.py`: tab Baseline Audit — tabella e pannello
+  dettaglio ora separati da un `QSplitter` verticale trascinabile. Il pannello
+  dettaglio non ha più altezza fissa (`setMaximumHeight(140)` rimosso);
+  proporzione iniziale 65% tabella / 35% dettaglio, ridimensionabile a piacere.
+- `app/version.py`: bumped a `1.4.1`.
+- `CHANGELOG.md`: aggiornato.
+
+---
+
+## [1.4.0] — 2026-03-04
+
+### Added
+- **Security Hardening Hub** — nuova sezione `SECURITY` nella sidebar con la
+  pagina `SecurityPage` (`app/ui/pages/security_page.py`).
+
+- **Baseline Audit tab**
+  - Engine `app/analytics/security_baseline.py` con 12 `BaselineCategory`
+    allineate ai Microsoft Security Baseline:
+    Compliance Policies, Microsoft Security Baselines, Defender Antivirus,
+    Attack Surface Reduction, BitLocker, Windows Firewall, Device Guard/VBS/HVCI,
+    Windows Update Rings, LAPS, Edge Browser, TLS/Protocol Hardening, UAC.
+  - Audit eseguito in background (`QThread`) per non bloccare la UI.
+  - Ogni categoria restituisce `status`: `covered | partial | missing`.
+  - Tabella con colonne: Categoria, Status, Policy trovate, Platform, Tipo.
+  - Pannello dettaglio sotto la tabella: policy abbinate e raccomandazione.
+
+- **Policy Advisor tab**
+  - Mostra solo categorie `missing` o `partial`, ordinate per priorità.
+  - `_CategoryCard` con bordo colorato (rosso = missing, giallo = partial),
+    descrizione, raccomandazione in evidenza, link alla documentazione Microsoft
+    e lista delle policy parzialmente abbinate.
+
+- **Security Report tab**
+  - Riepilogo testuale strutturato: Security Score %, conteggi per stato,
+    dettaglio per categoria, sezione "Prossimi Passi".
+  - Export CSV (`security_audit_YYYYMMDD_HHMMSS.csv`).
+  - Pulsante "Copia Report" per clipboard.
+
+- **KPI cards**: Security Score % con colore adattivo (verde ≥75%, giallo ≥40%,
+  rosso <40%), Coperti, Parziali, Mancanti.
+
+- **Sidebar**: aggiunta sezione `SECURITY` tra `GOVERNANCE` e `SETTINGS`
+  con voce `🛡️ Security Audit`.
+
+### Changed
+- `app/ui/pages/__init__.py`: aggiunto export `SecurityPage`.
+- `app/ui/main_window.py`: aggiunto import `SecurityPage`; nuova sezione
+  `SECURITY` in `nav_entries`; nuova entry `"security"` in `self._pages`.
+- `app/version.py`: bumped a `1.4.0`.
+- `README.md`: aggiornata versione e feature table.
+
+---
+
 ## [1.3.1] — 2026-03-04
 
 ### Fixed
@@ -21,7 +77,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - `app/analytics/app_monitoring_queries.py`: `get_app_install_summary()` uses `_fmt_dt()` for dates.
 - `app/ui/pages/app_ops_page.py`: rewritten — global KpiCard, simplified StateBar, correct portal URL.
 - `app/version.py`: bumped to `1.3.1`.
-
 
 ---
 
@@ -62,140 +117,80 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   - **Request Body editor** (JSON): appears automatically for `POST` / `PATCH`.
     Monospaced font, full height, placeholder with example body.
   - **Live JSON validation**: status indicator updates on every keystroke —
-    `✓ valid JSON` (green) or `✗ <error> (line N)` (red).
+    `✓ valid JSON` (green) or `✗ <e> (line N)` (red).
   - **Format JSON** button: pretty-prints and validates the body in place.
   - **Copy Result** button: copies the full JSON output to clipboard.
-  - **Preset library**: 7 built-in presets covering the most common endpoints,
-    including `getAppStatusOverviewReport` and `getDeviceInstallStatusReport`
-    with pre-filled example bodies.
+  - **Preset library**: 7 built-in presets covering the most common endpoints.
   - Paged-collection mode automatically disabled for non-GET methods.
   - Run button accent color changes per method (green=GET, blue=POST,
     yellow=PATCH, red=DELETE).
 
 ### Changed
-- `app/analytics/app_monitoring_queries.py`: `get_all_install_records()` and
-  `get_device_installs_for_app()` now return `_synthetic` and `_source` metadata
-  fields; both functions fall back to overview-derived rows when `DeviceAppStatus`
-  is empty. `get_install_state_distribution()` returns a list of
-  `{"state", "count"}` dicts (consistent with StateBar input format).
-- `app/ui/pages/app_ops_page.py`: full rewrite — new KpiCard, StateBar,
-  InfoBanner, empty states; context menus via unified `_build_context_menu_actions`
-  helper; cross-tab "Show in Install Log" action wired from App Catalog.
-- `app/ui/pages/graph_query_page.py`: full rewrite — method selector, body
-  editor, preset library, Copy Result, per-method run-button styling.
+- `app/analytics/app_monitoring_queries.py`: updated fallback logic.
+- `app/ui/pages/app_ops_page.py`: full rewrite.
+- `app/ui/pages/graph_query_page.py`: full rewrite.
 - `app/version.py`: bumped to `1.3.0`.
-- `README.md`: updated version badge, feature table (App Ops and Graph Query Lab
-  descriptions), added "App Ops — Data Sources" and "Graph Query Lab" sections,
-  corrected repo URL.
+- `README.md`: updated version badge and feature table.
 
 ---
 
 ## [1.2.9] — 2026-03-03
 
 ### Fixed
-- **App Ops — install counters still 0 in the UI despite overview data arriving**
-  — two root causes identified from `app_ops.log`:
-
-  1. **`getDeviceInstallStatusReport` called with `api_version="v1.0"`** — the
-     endpoint is beta-only for this tenant; v1.0 returned HTTP 400
-     `"Resource not found for the segment 'getDeviceInstallStatusReport'"`.
-     Fix: changed to `api_version="beta"` in `_fetch_device_install_status()`.
-
-  2. **`get_app_install_summary()` and `get_app_monitoring_kpis()` read only from
-     `DeviceAppStatus`** — the table remains empty until `getDeviceInstallStatusReport`
-     succeeds, even though `getAppStatusOverviewReport` (always working) stores
-     accurate counts in `App.raw_json["_install_overview"]` after every sync.
-     Fix: `get_app_install_summary()` now reads `_install_overview` from
-     `App.raw_json` as primary source; `get_app_monitoring_kpis()` sums all apps'
-     overview counts for KPI cards. `DeviceAppStatus` is kept as fallback for
-     demo mode and backwards compatibility.
+- **App Ops — install counters still 0** — two root causes:
+  1. `getDeviceInstallStatusReport` called with `api_version="v1.0"` — fixed to `beta`.
+  2. `get_app_install_summary()` read only from `DeviceAppStatus` — now uses
+     `App.raw_json["_install_overview"]` as primary source.
 
 ### Changed
-- `app/analytics/app_monitoring_queries.py`: `get_app_install_summary()` and
-  `get_app_monitoring_kpis()` use `App.raw_json["_install_overview"]` as primary
-  source. `get_install_state_distribution()` uses the same overview when available.
-- `app/collector/apps.py`: `_fetch_device_install_status()` uses `api_version="beta"`.
+- `app/analytics/app_monitoring_queries.py`: primary source switched.
+- `app/collector/apps.py`: `api_version="beta"` for device install status.
 
 ---
 
 ## [1.2.8] — 2026-03-03
 
 ### Fixed
-- **App Ops — all install status endpoints returning HTTP 400** — root cause:
-  the `/mobileApps/{id}/deviceStatuses` and `/mobileApps/{id}/deviceInstallStates`
-  navigation properties were removed from the Graph API `mobileApp` base class
-  in May 2023 (MC531735). They return `"Resource not found for the segment"`
-  for every app type, regardless of OData type cast.
-
-  Fix: replaced both endpoints with the official Intune Reports API:
-  - `POST /beta/deviceManagement/reports/getAppStatusOverviewReport`
-    (KPI aggregates: Installed, Failed, Pending, NotInstalled, NotApplicable)
-  - `POST /beta/deviceManagement/reports/getDeviceInstallStatusReport`
-    (per-device rows: DeviceId, DeviceName, InstallState, ErrorCode, …)
-
-  Aggregated counts stored in `App.raw_json["_install_overview"]` for UI use.
-  Per-device rows stored in `DeviceAppStatus` for drill-down and install log.
-
-  Ref: https://techcommunity.microsoft.com/blog/intunecustomersuccess/
-  support-tip-retrieving-intune-apps-reporting-data-from-microsoft-graph-beta-api
-
-### Changed
-- `app/graph/endpoints.py`: removed `APP_DEVICE_STATUSES` / `APP_WIN32_INSTALL_STATES`;
-  added `APP_STATUS_OVERVIEW_REPORT` and `APP_DEVICE_INSTALL_STATUS_REPORT`.
-- `app/collector/apps.py`: full rewrite of install-status methods to use Reports API.
-- `diagnose_apps.py`: updated to test both Reports API endpoints.
+- **App Ops — all install status endpoints returning HTTP 400** — replaced deprecated
+  `/deviceStatuses` and `/deviceInstallStates` with the Intune Reports API:
+  `getAppStatusOverviewReport` and `getDeviceInstallStatusReport`.
 
 ---
 
 ## [1.2.7] — 2026-03-03
 
 ### Fixed
-- **App Ops install status counters still 0 — root cause confirmed**: `$select` on
-  `/deviceStatuses` and `/deviceInstallStates` caused HTTP 400 for all app types
-  (polymorphic sub-resources). Removed `$select` from both calls.
-- **400 errors logged without actual Graph message**: now logs `e.raw` so the real
-  `errorCode` and `message` from Graph are visible in `app_ops.log`.
+- App Ops: `$select` removed from `/deviceStatuses` and `/deviceInstallStates`.
 
 ---
 
 ## [1.2.6] — 2026-03-03
 
 ### Fixed
-- **Device code prompt not appearing during Sync Now** — `SyncWorker` now emits a
-  `device_code_ready` signal; `SyncEngine.run_sync()` authenticates explicitly at
-  the start; `MainWindow.run_sync()` shows the same sign-in dialog as Settings.
-- **`diagnose_apps.py` stuck waiting** — added console `device_code_prompt()` callback.
+- Sync: device code dialog shown during Sync Now when token expires.
 
 ---
 
 ## [1.2.5] — 2026-03-03
 
-### Fixed
-- **Apps synced: 3 instead of 7** — v1.0 API silently excludes `winGetApp`,
-  `officeSuiteApp`, `windowsMicrosoftEdgeApp` in this tenant. Switched to beta API.
-
-### Added
-- `diagnose_apps.py` standalone diagnostic tool (v1.0 vs beta comparison).
-- Verbose per-app type logging at INFO level.
+### Changed
+- App Ops: mobileApps synced via beta API, verbose type logging.
 
 ---
 
 ## [1.2.4] — 2026-03-03
 
 ### Fixed
-- **Only win32 apps visible** — `$select` on polymorphic `mobileApps` collection
-  silently dropped non-win32 types. `APP_SELECT_FIELDS` set to `None`.
-- **win32LobApp 400 on `/deviceInstallStates`** — automatic fallback to `/deviceStatuses`.
+- App Ops: `$select` removed from mobileApps (polymorphic collection).
+- win32LobApp 400 on `/deviceInstallStates` — automatic fallback.
 
 ---
 
 ## [1.2.3] — 2026-03-03
 
 ### Fixed
-- **All status counters 0** — FK constraint + shared session caused entire batch
-  rollback on first FK violation. Per-record `session_scope` transactions.
+- All status counters 0 — FK constraint + shared session issue. Per-record `session_scope`.
 - `windowsMicrosoftEdgeApp` missing from `DEVICE_STATUS_SUPPORTED_TYPES`.
-- Meaningful errors upgraded from DEBUG to WARNING.
 
 ### Added
 - `app_ops.log` dedicated subsystem log (SCCM-style 2 MB rotation).
@@ -206,8 +201,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - `GraphClient.test_connection()` AttributeError at runtime.
-- App Ops counters 0 due to exact-case state comparisons; now case-insensitive
-  with Graph variant spelling support (`"success"` → installed, etc.).
+- App Ops counters 0 due to case-sensitive state comparisons.
 
 ### Changed
 - Log rotation: `SccmRotatingFileHandler` (2 MB threshold, date-stamped archives).
@@ -229,7 +223,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - Repeated device code on ReadWrite.All vs Read.All scope split.
-- Legacy plain-text cache migration to DPAPI.
 
 ---
 
@@ -238,7 +231,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - Device code dialog missing on "Test Graph Connection".
 - Scope tracking first-run bug.
-- `outcomes` / `device_app_statuses` DB migration.
 
 ---
 
