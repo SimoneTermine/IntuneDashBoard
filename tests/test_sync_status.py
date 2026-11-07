@@ -74,6 +74,103 @@ def test_successful_device_sync_returns_count_and_persists_device():
         assert db.get(Device, "synthetic-device-1").device_name == "Synthetic device"
 
 
+@pytest.mark.parametrize("value", [None, ""])
+def test_device_timestamp_parser_preserves_missing_values(value):
+    from app.collector.devices import _parse_dt
+
+    assert _parse_dt(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2025-02-03T04:05:06Z", datetime.fromisoformat("2025-02-03T04:05:06+00:00")),
+        ("2025-02-03T04:05:06+05:30", datetime.fromisoformat("2025-02-03T04:05:06+05:30")),
+        ("2025-02-03T04:05:06-04:00", datetime.fromisoformat("2025-02-03T04:05:06-04:00")),
+    ],
+)
+def test_device_timestamp_parser_accepts_iso_timestamps(value, expected):
+    from app.collector.devices import _parse_dt
+
+    assert _parse_dt(value) == expected
+
+
+@pytest.mark.parametrize("value", [" ", "synthetic-sensitive-invalid-timestamp"])
+def test_device_timestamp_parser_rejects_invalid_values_without_echoing_them(value):
+    from app.collector.devices import _parse_dt
+
+    with pytest.raises(ValueError) as error:
+        _parse_dt(value)
+
+    assert str(error.value) == "Invalid managed device timestamp"
+
+
+def test_invalid_device_timestamp_rolls_back_existing_device_update():
+    from app.collector.devices import DeviceCollector
+    from app.db.database import session_scope
+    from app.db.models import Device
+
+    with session_scope() as db:
+        db.add(Device(id="synthetic-device-existing", device_name="Original name"))
+
+    collector = DeviceCollector(Mock())
+    with pytest.raises(ValueError, match="Invalid managed device timestamp"):
+        collector._upsert_device({
+            "id": "synthetic-device-existing",
+            "deviceName": "Replacement name",
+            "lastSyncDateTime": "synthetic-sensitive-invalid-timestamp",
+        })
+
+    with session_scope() as db:
+        device = db.get(Device, "synthetic-device-existing")
+        assert device.device_name == "Original name"
+        assert device.last_sync_date_time is None
+
+
+def test_invalid_device_timestamp_continues_sync_and_reports_partial_status(
+    monkeypatch, caplog
+):
+    from app.collector.devices import DeviceCollector
+    from app.collector.sync_engine import SyncEngine
+    from app.db.database import session_scope
+    from app.db.models import Device
+
+    sensitive_value = "synthetic-sensitive-invalid-timestamp"
+    client = Mock()
+    client.get_paged.return_value = iter([
+        {
+            "id": "synthetic-device-invalid-timestamp",
+            "deviceName": "Invalid timestamp device",
+            "enrolledDateTime": sensitive_value,
+        },
+        {"id": "synthetic-device-after-invalid", "deviceName": "Valid device"},
+    ])
+    _configure_sync(monkeypatch, client)
+    engine = SyncEngine()
+    engine._sync_component = lambda component: (
+        DeviceCollector(client).sync_all() if component == "devices" else 2
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.collector.devices"):
+        log = engine.run_sync(components=["devices", "groups"], force=True)
+
+    details = json.loads(log.details_json)
+    assert log.status == "partial"
+    assert details["devices"] == {
+        "count": 1,
+        "status": "error",
+        "succeeded": 1,
+        "failed": 1,
+        "record_error_types": {"ValueError": 1},
+    }
+    assert details["groups"] == {"count": 2, "status": "ok"}
+    assert sensitive_value not in caplog.text
+    assert sensitive_value not in log.details_json
+    with session_scope() as db:
+        assert db.get(Device, "synthetic-device-invalid-timestamp") is None
+        assert db.get(Device, "synthetic-device-after-invalid") is not None
+
+
 def test_all_successful_components_set_success_status(monkeypatch):
     log = _run_sync(
         monkeypatch,
