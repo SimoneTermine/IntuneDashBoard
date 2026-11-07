@@ -17,7 +17,7 @@ class SyncWorker(QThread):
     """Runs a sync in a background thread, emits progress signals."""
 
     progress          = Signal(str, int, str, bool)  # stage, percent, message, is_error
-    finished          = Signal(bool, str)             # success, message
+    finished          = Signal(str, str)              # status, message
     device_code_ready = Signal(str, str)              # user_code, verification_uri
 
     def __init__(self, components=None, parent=None):
@@ -40,11 +40,11 @@ class SyncWorker(QThread):
                 self.components,
                 device_code_callback=on_device_code,
             )
-            self.finished.emit(log.status == "success", f"Sync {log.status}")
+            self.finished.emit(log.status, f"Sync {log.status}")
         except RuntimeError as e:
-            self.finished.emit(False, str(e))
+            self.finished.emit("failed", str(e))
         except Exception as e:
-            self.finished.emit(False, f"Sync error: {e}")
+            self.finished.emit("failed", f"Sync error ({type(e).__name__})")
 
 
 class AuthWorker(QThread):

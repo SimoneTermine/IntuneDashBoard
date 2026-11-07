@@ -337,16 +337,20 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"Sync: {message}")
         self._sync_widget.update_progress(stage, percent, message, is_error)
 
-    def _on_sync_finished(self, success: bool, message: str):
+    def _on_sync_finished(self, status: str, message: str):
         self._sync_widget.set_syncing(False)
-        if success:
-            self._status_bar.showMessage(f"Sync complete — {message}")
+        if status in ("success", "partial"):
             current = self._stack.currentWidget()
             if current and hasattr(current, "refresh"):
                 try:
                     current.refresh()
                 except Exception:
                     pass
+        if status == "success":
+            self._status_bar.showMessage(f"Sync complete — {message}")
+        elif status == "partial":
+            self._status_bar.showMessage(f"Sync partially complete — {message}")
+            QMessageBox.warning(self, "Sync Partially Complete", message)
         else:
             self._status_bar.showMessage(f"Sync failed: {message}")
             QMessageBox.warning(self, "Sync Failed", message)
