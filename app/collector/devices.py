@@ -33,12 +33,13 @@ class DeviceSyncError(Exception):
 
 
 def _parse_dt(val: Optional[str]) -> Optional[datetime]:
-    if not val:
+    if val is None or val == "":
         return None
     try:
-        return datetime.fromisoformat(val.replace("Z", "+00:00"))
-    except Exception:
-        return None
+        normalized = val[:-1] + "+00:00" if val.endswith("Z") else val
+        return datetime.fromisoformat(normalized)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Invalid managed device timestamp") from None
 
 
 class DeviceCollector:
