@@ -25,7 +25,7 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install pytest PySide6 SQLAlchemy requests msal
 
-      - name: Run sync status tests
+      - name: Run focused collector tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest tests/test_sync_status.py -q
+        run: python -m pytest tests/test_sync_status.py tests/test_policies.py -q

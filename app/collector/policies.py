@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 
 from app.db.database import session_scope
-from app.db.models import Control, Assignment, DeviceComplianceStatus
+from app.db.models import Control, Assignment
 from app.graph.client import GraphClient
 from app.graph.endpoints import (
     DEVICE_COMPLIANCE_POLICIES, DEVICE_COMPLIANCE_ASSIGNMENTS,
@@ -20,6 +20,23 @@ from app.graph.endpoints import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class PolicySyncError(Exception):
+    """Sanitized summary of records or requests that made a policy sync incomplete."""
+
+    def __init__(
+        self,
+        operation: str,
+        succeeded_count: int,
+        failed_count: int,
+        error_counts: dict[str, int],
+    ):
+        super().__init__(f"{operation} collection was incomplete")
+        self.operation = operation
+        self.succeeded_count = succeeded_count
+        self.failed_count = failed_count
+        self.error_counts = error_counts
 
 
 def _parse_dt(val: Optional[str]) -> Optional[datetime]:
@@ -37,54 +54,73 @@ class PolicyCollector:
     def __init__(self, client: GraphClient):
         self.client = client
 
+    @staticmethod
+    def _record_error(error_counts: dict[str, int], operation: str, error: Exception) -> None:
+        key = f"{operation}:{type(error).__name__}"
+        error_counts[key] = error_counts.get(key, 0) + 1
+
+    @staticmethod
+    def _merge_error_counts(target: dict[str, int], source: dict[str, int]) -> None:
+        for key, count in source.items():
+            target[key] = target.get(key, 0) + count
+
+    @staticmethod
+    def _raise_if_incomplete(
+        operation: str,
+        succeeded_count: int,
+        failed_count: int,
+        error_counts: dict[str, int],
+    ) -> None:
+        if failed_count:
+            raise PolicySyncError(operation, succeeded_count, failed_count, error_counts)
+
     # ------------------------------------------------------------------
     # Compliance Policies
     # ------------------------------------------------------------------
     def sync_compliance_policies(self) -> int:
         logger.info("Syncing compliance policies...")
         count = 0
+        failed_count = 0
+        error_counts: dict[str, int] = {}
         params = {"$select": COMPLIANCE_POLICY_SELECT_FIELDS}
 
-        for raw in self.client.get_paged(DEVICE_COMPLIANCE_POLICIES, params=params):
-            try:
-                self._upsert_control(raw, "compliance_policy", "v1.0")
-                count += 1
-            except Exception as e:
-                logger.error(f"Error processing compliance policy {raw.get('id')}: {e}")
+        try:
+            for raw in self.client.get_paged(DEVICE_COMPLIANCE_POLICIES, params=params):
+                try:
+                    self._upsert_control(raw, "compliance_policy", "v1.0")
+                    count += 1
+                except Exception as e:
+                    failed_count += 1
+                    self._record_error(error_counts, "compliance_policy_record", e)
+                    logger.error("Failed to process compliance policy record (%s)", type(e).__name__)
+        except Exception as e:
+            failed_count += 1
+            self._record_error(error_counts, "compliance_policy_request", e)
+            logger.error("Compliance policy request failed (%s)", type(e).__name__)
 
-        logger.info(f"Compliance policies synced: {count}")
+        logger.info("Compliance policies processed: %d succeeded, %d failed", count, failed_count)
+        self._raise_if_incomplete("compliance policies", count, failed_count, error_counts)
         return count
 
     def sync_compliance_device_statuses(self, policy_id: str) -> list:
         """
         Fetch per-device compliance status for a specific policy.
         Returns list of raw status dicts.
-        Used lazily from device detail view.
+        The Graph response does not provide managedDeviceId, so these rows
+        cannot be safely persisted as per-device statuses.
         """
         endpoint = DEVICE_COMPLIANCE_DEVICE_STATUS.format(policy_id=policy_id)
         try:
-            statuses = self.client.get_all(endpoint, api_version="v1.0")
-            with session_scope() as db:
-                for raw in statuses:
-                    sid = raw.get("id", "")
-                    device_id = raw.get("managedDeviceId", "")
-                    if not sid or not device_id:
-                        continue
-                    s = db.get(DeviceComplianceStatus, sid) or DeviceComplianceStatus(id=sid)
-                    s.device_id = device_id
-                    s.policy_id = policy_id
-                    s.policy_display_name = raw.get("policyDisplayName", "")
-                    s.status = raw.get("status", "")
-                    s.last_report_datetime = _parse_dt(raw.get("lastReportedDateTime"))
-                    s.user_name = raw.get("userName", "")
-                    s.user_principal_name = raw.get("userPrincipalName", "")
-                    s.raw_json = json.dumps(raw)
-                    s.synced_at = datetime.utcnow()
-                    db.merge(s)
-            return statuses
+            return self.client.get_all(endpoint, api_version="v1.0")
         except Exception as e:
-            logger.error(f"Error fetching compliance statuses for policy {policy_id}: {e}")
-            return []
+            error_type = type(e).__name__
+            logger.error("Compliance device status request failed (%s)", error_type)
+            raise PolicySyncError(
+                "compliance device statuses",
+                succeeded_count=0,
+                failed_count=1,
+                error_counts={f"compliance_device_status_request:{error_type}": 1},
+            ) from e
 
     # ------------------------------------------------------------------
     # Device Configuration Policies (classic)
@@ -92,44 +128,65 @@ class PolicyCollector:
     def sync_config_policies(self) -> int:
         logger.info("Syncing device configurations...")
         count = 0
+        failed_count = 0
+        error_counts: dict[str, int] = {}
         params = {"$select": DEVICE_CONFIG_SELECT_FIELDS}
 
-        for raw in self.client.get_paged(DEVICE_CONFIGURATIONS, params=params):
-            try:
-                # Determine platform from OData type
-                odata_type = raw.get("@odata.type", "")
-                platform = _infer_platform(odata_type)
-                self._upsert_control(raw, "config_policy", "v1.0", platform=platform)
-                count += 1
-            except Exception as e:
-                logger.error(f"Error processing config policy {raw.get('id')}: {e}")
+        try:
+            for raw in self.client.get_paged(DEVICE_CONFIGURATIONS, params=params):
+                try:
+                    odata_type = raw.get("@odata.type", "")
+                    platform = _infer_platform(odata_type)
+                    self._upsert_control(raw, "config_policy", "v1.0", platform=platform)
+                    count += 1
+                except Exception as e:
+                    failed_count += 1
+                    self._record_error(error_counts, "config_policy_record", e)
+                    logger.error("Failed to process configuration policy record (%s)", type(e).__name__)
+        except Exception as e:
+            failed_count += 1
+            self._record_error(error_counts, "config_policy_request", e)
+            logger.error("Configuration policy request failed (%s)", type(e).__name__)
 
         # Also sync settings catalog (endpoint security, settings catalog) — beta
         try:
             count += self.sync_settings_catalog_policies()
-        except Exception as e:
-            logger.warning(f"Settings catalog sync partial failure: {e}")
+        except PolicySyncError as e:
+            count += e.succeeded_count
+            failed_count += e.failed_count
+            self._merge_error_counts(error_counts, e.error_counts)
 
-        logger.info(f"Config policies synced: {count}")
+        logger.info("Configuration policies processed: %d succeeded, %d failed", count, failed_count)
+        self._raise_if_incomplete("configuration policies", count, failed_count, error_counts)
         return count
 
     def sync_settings_catalog_policies(self) -> int:
         """Sync settings catalog / endpoint security policies (beta API)."""
         logger.info("Syncing settings catalog policies (beta)...")
         count = 0
+        failed_count = 0
+        error_counts: dict[str, int] = {}
         params = {"$select": "id,name,description,createdDateTime,lastModifiedDateTime,settingCount,platforms,technologies"}
 
-        for raw in self.client.get_paged(SETTINGS_CATALOG_POLICIES, params=params, api_version="beta"):
-            try:
-                # Rename 'name' to 'displayName' for consistency
-                raw["displayName"] = raw.pop("name", raw.get("displayName", ""))
-                technologies = raw.get("technologies", "")
-                ctrl_type = "endpoint_security" if "endpointSecurity" in technologies.lower() else "settings_catalog"
-                self._upsert_control(raw, ctrl_type, "beta")
-                count += 1
-            except Exception as e:
-                logger.error(f"Error processing settings catalog policy {raw.get('id')}: {e}")
+        try:
+            for raw in self.client.get_paged(SETTINGS_CATALOG_POLICIES, params=params, api_version="beta"):
+                try:
+                    raw["displayName"] = raw.pop("name", raw.get("displayName", ""))
+                    technologies = raw.get("technologies", "")
+                    ctrl_type = "endpoint_security" if "endpointSecurity" in technologies.lower() else "settings_catalog"
+                    self._upsert_control(raw, ctrl_type, "beta")
+                    count += 1
+                except Exception as e:
+                    failed_count += 1
+                    self._record_error(error_counts, "settings_catalog_record", e)
+                    logger.error("Failed to process settings catalog policy record (%s)", type(e).__name__)
+        except Exception as e:
+            failed_count += 1
+            self._record_error(error_counts, "settings_catalog_request", e)
+            logger.error("Settings catalog request failed (%s)", type(e).__name__)
 
+        logger.info("Settings catalog policies processed: %d succeeded, %d failed", count, failed_count)
+        self._raise_if_incomplete("settings catalog policies", count, failed_count, error_counts)
         return count
 
     # ------------------------------------------------------------------
@@ -139,6 +196,8 @@ class PolicyCollector:
         """Sync assignments for all controls in DB."""
         logger.info("Syncing assignments for all controls...")
         total = 0
+        failed_count = 0
+        error_counts: dict[str, int] = {}
         with session_scope() as db:
             controls = db.query(Control).all()
             control_ids = [(c.id, c.control_type, c.api_source) for c in controls]
@@ -147,10 +206,17 @@ class PolicyCollector:
             try:
                 count = self._sync_assignments_for(ctrl_id, ctrl_type, api_source or "v1.0")
                 total += count
+            except PolicySyncError as e:
+                total += e.succeeded_count
+                failed_count += e.failed_count
+                self._merge_error_counts(error_counts, e.error_counts)
             except Exception as e:
-                logger.warning(f"Could not sync assignments for {ctrl_id}: {e}")
+                failed_count += 1
+                self._record_error(error_counts, "assignment_persistence", e)
+                logger.error("Assignment sync failed (%s)", type(e).__name__)
 
-        logger.info(f"Total assignments synced: {total}")
+        logger.info("Assignments processed: %d succeeded, %d failed", total, failed_count)
+        self._raise_if_incomplete("assignments", total, failed_count, error_counts)
         return total
 
     def _sync_assignments_for(self, ctrl_id: str, ctrl_type: str, api_version: str) -> int:
@@ -166,41 +232,83 @@ class PolicyCollector:
         try:
             items = self.client.get_all(endpoint, api_version=api_version)
         except Exception as e:
-            logger.debug(f"Assignment fetch skipped for {ctrl_id}: {e}")
-            return 0
+            error_type = type(e).__name__
+            logger.error("Assignment request failed (%s)", error_type)
+            raise PolicySyncError(
+                "assignment fetch",
+                succeeded_count=0,
+                failed_count=1,
+                error_counts={f"assignment_request:{error_type}": 1},
+            ) from e
 
-        count = 0
-        with session_scope() as db:
-            for raw in items:
-                a = self._parse_assignment(raw, ctrl_id)
-                if a:
-                    existing = db.get(Assignment, a.id)
-                    if existing:
-                        existing.target_type = a.target_type
-                        existing.target_id = a.target_id
-                        existing.intent = a.intent
-                        existing.filter_id = a.filter_id
-                        existing.filter_type = a.filter_type
-                        existing.raw_json = a.raw_json
-                        existing.synced_at = datetime.utcnow()
-                    else:
-                        db.add(a)
-                    count += 1
+        parsed = []
+        failed_count = 0
+        error_counts: dict[str, int] = {}
+        for raw in items:
+            try:
+                assignment = self._parse_assignment(raw, ctrl_id)
+            except Exception as e:
+                failed_count += 1
+                self._record_error(error_counts, "assignment_record", e)
+                continue
+            if assignment is None:
+                failed_count += 1
+                key = "assignment_record:InvalidRecord"
+                error_counts[key] = error_counts.get(key, 0) + 1
+            else:
+                parsed.append(assignment)
 
-        # Update assignment count on control
+        current_ids = {assignment.id for assignment in parsed}
         with session_scope() as db:
+            if not failed_count:
+                stale_query = db.query(Assignment).filter(Assignment.control_id == ctrl_id)
+                if current_ids:
+                    stale_query = stale_query.filter(~Assignment.id.in_(current_ids))
+                stale_query.delete(synchronize_session=False)
+
+            for assignment in parsed:
+                existing = db.get(Assignment, assignment.id)
+                if existing:
+                    existing.control_id = ctrl_id
+                    existing.target_type = assignment.target_type
+                    existing.target_id = assignment.target_id
+                    existing.target_display_name = assignment.target_display_name
+                    existing.intent = assignment.intent
+                    existing.filter_id = assignment.filter_id
+                    existing.filter_type = assignment.filter_type
+                    existing.raw_json = assignment.raw_json
+                    existing.synced_at = assignment.synced_at
+                else:
+                    db.add(assignment)
+
+            db.flush()
             ctrl = db.get(Control, ctrl_id)
             if ctrl:
-                ctrl.assignment_count = count
-                ctrl.is_assigned = count > 0
+                ctrl.assignment_count = db.query(Assignment).filter(
+                    Assignment.control_id == ctrl_id
+                ).count()
+                ctrl.is_assigned = ctrl.assignment_count > 0
 
-        return count
+        if failed_count:
+            raise PolicySyncError(
+                "assignment records",
+                succeeded_count=len(parsed),
+                failed_count=failed_count,
+                error_counts=error_counts,
+            )
+        return len(current_ids)
 
     def _parse_assignment(self, raw: dict, ctrl_id: str) -> Optional[Assignment]:
+        if not isinstance(raw, dict):
+            return None
         target = raw.get("target", {})
+        if not isinstance(target, dict):
+            return None
         odata = target.get("@odata.type", "")
+        if not isinstance(odata, str):
+            return None
         assignment_id = raw.get("id", "")
-        if not assignment_id:
+        if not isinstance(assignment_id, str) or not assignment_id:
             return None
 
         target_type = "unknown"
@@ -246,7 +354,7 @@ class PolicyCollector:
     def _upsert_control(self, raw: dict, ctrl_type: str, api_source: str, platform: str | None = None):
         ctrl_id = raw.get("id", "")
         if not ctrl_id:
-            return
+            raise ValueError("Policy record has no identifier")
         with session_scope() as db:
             ctrl = db.get(Control, ctrl_id) or Control(id=ctrl_id)
             ctrl.display_name = raw.get("displayName", raw.get("name", ""))
@@ -267,7 +375,7 @@ def _infer_platform(odata_type: str) -> str:
         "windows": "windows",
         "ios": "ios",
         "android": "android",
-        "macOS": "macOS",
+        "macos": "macOS",
         "osx": "macOS",
     }
     lower = odata_type.lower()

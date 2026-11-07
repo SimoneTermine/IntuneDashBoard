@@ -147,6 +147,7 @@ class SyncEngine:
                                f"{comp}: {count} items synced")
                 except Exception as e:
                     from app.collector.devices import DeviceSyncError
+                    from app.collector.policies import PolicySyncError
 
                     failed_components += 1
                     if isinstance(e, DeviceSyncError):
@@ -169,6 +170,28 @@ class SyncEngine:
                             comp,
                             base_progress,
                             f"Device sync incomplete: {e.succeeded_count} succeeded, "
+                            f"{e.failed_count} failed",
+                            error=True,
+                        )
+                        continue
+
+                    if isinstance(e, PolicySyncError):
+                        results[comp] = {
+                            "count": e.succeeded_count,
+                            "status": "error",
+                            "succeeded": e.succeeded_count,
+                            "failed": e.failed_count,
+                            "error_counts": e.error_counts,
+                        }
+                        logger.error(
+                            "Policy component incomplete: %d succeeded, %d failed",
+                            e.succeeded_count,
+                            e.failed_count,
+                        )
+                        self._emit(
+                            comp,
+                            base_progress,
+                            f"Policy sync incomplete: {e.succeeded_count} succeeded, "
                             f"{e.failed_count} failed",
                             error=True,
                         )
