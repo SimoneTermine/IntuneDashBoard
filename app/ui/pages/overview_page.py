@@ -106,7 +106,11 @@ class OverviewPage(QWidget):
             log_lines = []
             for log in logs:
                 ts = log["started_at"].strftime("%Y-%m-%d %H:%M") if log["started_at"] else "?"
-                status_icon = "✓" if log["status"] == "success" else "✗" if log["status"] == "failed" else "⟳"
+                status_icon = {
+                    "success": "✓",
+                    "partial": "⚠",
+                    "failed": "✗",
+                }.get(log["status"], "⟳")
                 err = f"  ERROR: {log['error_message']}" if log["error_message"] else ""
                 log_lines.append(f"[{ts}] {status_icon} {log['status'].upper()} — {log['devices_synced']} devices{err}")
             self._sync_log_text.setPlainText("\n".join(log_lines) if log_lines else "No sync history")

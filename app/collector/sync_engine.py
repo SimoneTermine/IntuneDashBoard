@@ -111,9 +111,15 @@ class SyncEngine:
                 self._emit("auth", 2, "Verifying authentication...")
                 client.authenticate(device_code_callback=device_code_callback)
             except Exception as e:
-                logger.error(f"Authentication failed before sync: {e}", exc_info=True)
-                self._emit("auth", 0, f"Authentication failed: {e}", error=True)
-                return self._finish_log(sync_log, "failed", {}, error_message=str(e))
+                error_type = type(e).__name__
+                logger.error("Authentication failed before sync (%s)", error_type)
+                self._emit("auth", 0, f"Authentication failed ({error_type})", error=True)
+                return self._finish_log(
+                    sync_log,
+                    "failed",
+                    {},
+                    error_message=f"Authentication failed ({error_type})",
+                )
 
             all_components = components or [
                 "devices",
@@ -127,6 +133,8 @@ class SyncEngine:
             ]
             steps   = len(all_components)
             results = {}
+            succeeded_components = 0
+            failed_components = 0
 
             for i, comp in enumerate(all_components):
                 base_progress = int((i / steps) * 90)
@@ -134,21 +142,75 @@ class SyncEngine:
                 try:
                     count = self._sync_component(comp)
                     results[comp] = {"count": count, "status": "ok"}
+                    succeeded_components += 1
                     self._emit(comp, base_progress + int(90 / steps),
                                f"{comp}: {count} items synced")
                 except Exception as e:
-                    logger.error(f"Sync component '{comp}' failed: {e}", exc_info=True)
-                    results[comp] = {"count": 0, "status": "error", "error": str(e)}
-                    self._emit(comp, base_progress, f"{comp} failed: {e}", error=True)
+                    from app.collector.devices import DeviceSyncError
+
+                    failed_components += 1
+                    if isinstance(e, DeviceSyncError):
+                        result = {
+                            "count": e.succeeded_count,
+                            "status": "error",
+                            "succeeded": e.succeeded_count,
+                            "failed": e.failed_count,
+                            "record_error_types": e.record_error_types,
+                        }
+                        if e.paging_error_type:
+                            result["paging_error_type"] = e.paging_error_type
+                        results[comp] = result
+                        logger.error(
+                            "Device component incomplete: %d succeeded, %d failed",
+                            e.succeeded_count,
+                            e.failed_count,
+                        )
+                        self._emit(
+                            comp,
+                            base_progress,
+                            f"Device sync incomplete: {e.succeeded_count} succeeded, "
+                            f"{e.failed_count} failed",
+                            error=True,
+                        )
+                        continue
+
+                    error_type = type(e).__name__
+                    results[comp] = {
+                        "count": 0,
+                        "status": "error",
+                        "error_type": error_type,
+                    }
+                    logger.error("Sync component failed (%s)", error_type)
+                    self._emit(
+                        comp,
+                        base_progress,
+                        f"Component failed ({error_type})",
+                        error=True,
+                    )
 
             SyncEngine._last_sync_time = datetime.utcnow()
-            self._emit("done", 100, "Sync complete")
-            return self._finish_log(sync_log, "success", results)
+            if failed_components == 0:
+                status = "success"
+                error_message = None
+            elif succeeded_components == 0:
+                status = "failed"
+                error_message = "All requested components failed"
+            else:
+                status = "partial"
+                error_message = "One or more components failed"
+            self._emit("done", 100, f"Sync {status}")
+            return self._finish_log(sync_log, status, results, error_message=error_message)
 
         except Exception as e:
-            logger.error(f"Sync failed: {e}", exc_info=True)
-            self._emit("error", 0, f"Sync failed: {e}", error=True)
-            return self._finish_log(sync_log, "failed", {}, error_message=str(e))
+            error_type = type(e).__name__
+            logger.error("Sync failed (%s)", error_type)
+            self._emit("error", 0, f"Sync failed ({error_type})", error=True)
+            return self._finish_log(
+                sync_log,
+                "failed",
+                {},
+                error_message=f"Sync failed ({error_type})",
+            )
         finally:
             self._running = False
 
@@ -181,8 +243,8 @@ class SyncEngine:
             from app.collector.memberships import MembershipCollector
             return MembershipCollector(client).sync_all_memberships()
 
-        logger.warning(f"Unknown sync component: {component}")
-        return 0
+        logger.warning("Unknown sync component requested")
+        raise ValueError("Unknown sync component")
 
     def _run_demo_sync(self, sync_log: SyncLog) -> SyncLog:
         import time
