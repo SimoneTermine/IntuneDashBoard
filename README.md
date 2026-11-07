@@ -5,7 +5,7 @@ Connects to Microsoft Graph API, caches data in a local SQLite database,
 and provides a rich UI for device management, policy exploration, governance,
 and security baseline auditing.
 
-**Current version: 1.4.0**
+**Current version: 1.4.1**
 
 ---
 
